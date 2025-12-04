@@ -5,6 +5,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/python/sgl_kernel_npu/s
 FILE(GLOB OP_SRCS
     ${PROJECT_OP_SRC_BASE}/pytorch_extensions.cpp
     ${PROJECT_OP_SRC_BASE}/helloworld/op_host/helloworld.cpp
+    ${PROJECT_OP_SRC_BASE}/grouped_gemv/op_host/grouped_gemv_w4a16_moe.cpp
     ${PROJECT_OP_SRC_BASE}/cache_location_assign/op_host/cache_loc_assign.cpp
     ${PROJECT_OP_SRC_BASE}/alloc_extend/op_host/alloc_extend_tiling.cpp
     ${PROJECT_OP_SRC_BASE}/assign_cache_op/op_host/assign_cache.cpp
@@ -30,6 +31,7 @@ set(OP_PLUGIN_NAME sgl_kernel_npu)
 # kernel side files without workspace
 ascendc_library(no_workspace_kernel STATIC
     ${PROJECT_OP_SRC_BASE}/helloworld/op_kernel/kernel_helloworld.cpp
+    ${PROJECT_OP_SRC_BASE}/grouped_gemv/op_kernel/grouped_gemv_w4a16_moe.cpp
     ${PROJECT_OP_SRC_BASE}/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
     ${PROJECT_OP_SRC_BASE}/assign_cache_op/op_kernel/assign_cache_op.cpp
     ${PROJECT_OP_SRC_BASE}/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
