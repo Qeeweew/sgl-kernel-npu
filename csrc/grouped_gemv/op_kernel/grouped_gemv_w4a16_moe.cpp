@@ -7,7 +7,7 @@ using namespace AscendC;
 // 常量定义
 // -----------------------------------------------------------------------------
 constexpr int32_t BUFFER_NUM = 2;
-constexpr int32_t TILE_N = 256;       // 每个Tile处理256个输出列
+constexpr int32_t TILE_N = 1024;       // 每个Tile处理256个输出列
 constexpr int32_t GROUP_SIZE = 32;    // 量化分组大小
 constexpr int32_t PACK_RATIO = 8;     // int32 包含 8个 int4
 constexpr int32_t TILE_N_PACKED = TILE_N / PACK_RATIO; // int32个数
@@ -45,16 +45,12 @@ public:
         pipe.InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
         pipe.InitBuffer(inQueueW, BUFFER_NUM, GROUP_SIZE * TILE_N_PACKED * sizeof(int32_t));
         pipe.InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(T));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float));
 
         // 4. 初始化 Workspace (calcBuf) 并预计算 Offset
         // 必须保证每个 Offset 都是 32 字节对齐。
         // TILE_N=256, GROUP_SIZE=32，最小的数据块是 x_half (32*2=64B)，均满足对齐。
         uint32_t current_offset = 0;
-
-        // Global Accumulator (float)
-        this->offset_global_acc = current_offset;
-        current_offset += TILE_N * sizeof(float);
 
         // Group Accumulator (float)
         this->offset_group_acc = current_offset;
@@ -97,7 +93,8 @@ private:
 
         // 1. 获取并初始化 Global Accumulator
         // 使用 GetWithOffset 获取指定内存区域
-        LocalTensor<float> global_acc = calcBuf.GetWithOffset<float>(TILE_N, offset_global_acc);
+        outQueueY.AllocTensor<T>(y_local);
+        auto global_acc = y_local.template ReinterpretCast<float>();
         Duplicate(global_acc, 0.0f, TILE_N);
 
         // 2. 循环遍历 Groups
@@ -106,7 +103,8 @@ private:
             Compute(global_acc); // 将 global_acc 传给 Compute 进行累加
         }
 
-        CopyOut(row_idx, n_start, global_acc);
+        outQueueY.EnQue(y_local);
+        CopyOut(row_idx, n_start);
     }
 
     __aicore__ inline void CopyIn(int32_t expert_id, int32_t row_idx, int32_t group_idx, int32_t n_start)
@@ -117,19 +115,17 @@ private:
                             (uint64_t)group_idx * GROUP_SIZE * w_stride_k + 
                             (n_start / PACK_RATIO);
         
-        LocalTensor<int32_t> w_local = inQueueW.AllocTensor<int32_t>();
+        inQueueW.AllocTensor<int32_t>(w_local);
         
-        DataCopyParams w_copy_params;
-        w_copy_params.blockCount = GROUP_SIZE;
-        w_copy_params.blockLen = TILE_N_PACKED * sizeof(int32_t);
-        w_copy_params.srcStride = w_stride_k - TILE_N_PACKED; 
+        AscendC::DataCopyExtParams w_copy_params{GROUP_SIZE, (uint32_t) (TILE_N_PACKED * sizeof(int32_t)), (uint32_t) ((w_stride_k - TILE_N_PACKED) * sizeof(int32_t)), 0, 0};
+        AscendC::DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
+        DataCopyPad(w_local, weightGm[w_offset], w_copy_params, padParams);
 
-        DataCopy(w_local, weightGm[w_offset], w_copy_params);
         inQueueW.EnQue(w_local);
 
         // Load X
         uint64_t x_offset = (uint64_t)row_idx * this->in_dim + group_idx * GROUP_SIZE;
-        LocalTensor<T> x_local = inQueueX.AllocTensor<T>();
+        inQueueX.AllocTensor<T>(x_local);
         DataCopy(x_local, xGm[x_offset], GROUP_SIZE);
         inQueueX.EnQue(x_local);
 
@@ -137,19 +133,18 @@ private:
         uint64_t s_offset = (uint64_t)expert_id * this->num_groups * this->out_dim +
                             (uint64_t)group_idx * this->out_dim + 
                             n_start;
-        LocalTensor<T> s_local = inQueueScale.AllocTensor<T>();
+        inQueueScale.AllocTensor<T>(s_local);
         DataCopy(s_local, scalesGm[s_offset], TILE_N);
         inQueueScale.EnQue(s_local);
     }
 
     __aicore__ inline void Compute(LocalTensor<float>& global_acc)
     {
-        LocalTensor<int32_t> w_packed = inQueueW.DeQue<int32_t>();
-        LocalTensor<T> x_bf16 = inQueueX.DeQue<T>();
-        LocalTensor<T> s_bf16 = inQueueScale.DeQue<T>();
+        inQueueW.DeQue<int32_t>(w_local);
+        inQueueX.DeQue<T>(x_local);
+        inQueueScale.DeQue<T>(s_local);
 
         // 使用 GetWithOffset 获取 Workspace 中的临时 Tensor
-        // 这些 Tensor 在 calcBuf 中复用内存，无需反复 Alloc/Free
         LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(TILE_N, offset_group_acc);
         LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_SIZE * TILE_N, offset_w_half);
         LocalTensor<float> x_float_tmp = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
@@ -158,55 +153,54 @@ private:
 
         // 1. 类型转换
         // Weight: int32 -> int4b -> half
-        LocalTensor<int4b_t> w_int4 = w_packed.ReinterpretCast<int4b_t>();
+        LocalTensor<int4b_t> w_int4 = w_local.ReinterpretCast<int4b_t>();
         Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_SIZE * TILE_N);
 
         // X: bf16 -> float -> half
-        Cast(x_float_tmp, x_bf16, RoundMode::CAST_NONE, GROUP_SIZE);
-        Cast(x_half, x_float_tmp, RoundMode::CAST_NONE, GROUP_SIZE);
+        Cast(x_float_tmp, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
+        Cast(x_half, x_float_tmp, RoundMode::CAST_RINT, GROUP_SIZE);
 
         // Scale: bf16 -> float
-        Cast(s_float, s_bf16, RoundMode::CAST_NONE, TILE_N);
+        Cast(s_float, s_local, RoundMode::CAST_NONE, TILE_N);
+
+        half x_buf[GROUP_SIZE];
+        for (int i = 0; i < GROUP_SIZE; i++) {
+            x_buf[i] = x_half.GetValue(i);
+        }
 
         // 2. 矩阵乘 (Group Level)
         Duplicate(group_acc, 0.0f, TILE_N);
         for (int i = 0; i < GROUP_SIZE; ++i) {
             // group_acc += w_row[i] * x_scalar[i]
-            Axpy(group_acc, w_half[i * TILE_N], x_half.GetValue(i), TILE_N);
+            Axpy(group_acc, w_half[i * TILE_N], x_buf[i], TILE_N);
         }
 
         // 3. 应用 Scale 并累加到 Global
-        Mul(group_acc, group_acc, s_float, TILE_N);
-        Add(global_acc, global_acc, group_acc, TILE_N);
+        MulAddDst(global_acc, group_acc, s_float, TILE_N);
 
-        inQueueW.FreeTensor(w_packed);
-        inQueueX.FreeTensor(x_bf16);
-        inQueueScale.FreeTensor(s_bf16);
+        inQueueW.FreeTensor(w_local);
+        inQueueX.FreeTensor(x_local);
+        inQueueScale.FreeTensor(s_local);
     }
 
-    __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_start, LocalTensor<float>& global_acc)
+    __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_start)
     {
-        LocalTensor<T> y_local = outQueueY.AllocTensor<T>();
-
-        // Float -> Bfloat16
-        Cast(y_local, global_acc, RoundMode::CAST_NONE, TILE_N);
-
+        outQueueY.DeQue<T>(y_local);
+        Cast(y_local, y_local.template ReinterpretCast<float>(), RoundMode::CAST_RINT, TILE_N);
+        PipeBarrier<PIPE_V>();
         uint64_t y_offset = (uint64_t)row_idx * this->out_dim + n_start;
         DataCopy(yGm[y_offset], y_local, TILE_N);
-
-        outQueueY.EnQue(y_local);
         outQueueY.FreeTensor(y_local);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueW, inQueueScale;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 0> outQueueY;
     
     // 统一管理计算缓冲区
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
     // 缓冲区内的偏移量变量
-    uint32_t offset_global_acc;
     uint32_t offset_group_acc;
     uint32_t offset_w_half;
     uint32_t offset_x_float;
@@ -218,6 +212,12 @@ private:
     AscendC::GlobalTensor<T> scalesGm;
     AscendC::GlobalTensor<int32_t> expertIdsGm;
     AscendC::GlobalTensor<T> yGm;
+
+    LocalTensor<T> x_local;
+    LocalTensor<T> s_local;
+    LocalTensor<T> y_local;
+    LocalTensor<int32_t> w_local;
+
 
     int32_t top_k;
     int32_t in_dim;
@@ -233,6 +233,7 @@ extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe(
     GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, 
     GM_ADDR y, GM_ADDR tiling)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     KernelGroupedGemvW4A16Moe<bfloat16_t> op;
     op.Init(x, weight, scales, expert_ids, y, tiling);
     op.Process();

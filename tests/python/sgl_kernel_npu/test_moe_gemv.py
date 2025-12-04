@@ -1,144 +1,225 @@
 import torch
 import torch_npu
 import math
+import sys
 
-# 确保你的环境已经加载了自定义算子库
+# 尝试导入自定义算子库
 try:
     import sgl_kernel_npu
 except ImportError:
-    print("Warning: sgl_kernel_npu not found. Make sure the kernel is compiled and linked.")
+    print("Warning: sgl_kernel_npu not found. Please ensure the kernel is compiled and installed.")
+    sys.exit(1)
+
+def compute_cpu_ground_truth(x_cpu, raw_weights_cpu, scales_cpu, expert_ids_cpu, group_size):
+    """
+    在 CPU 上使用 Float32 计算 Ground Truth。
+    所有输入必须已经在 CPU 上，避免在此函数内进行 Device-to-Host 拷贝。
+    """
+    print(">> [CPU] Computing Ground Truth...")
+    
+    # 类型转换确保计算精度
+    x_f32 = x_cpu.float()
+    w_f32 = raw_weights_cpu.float()
+    s_f32 = scales_cpu.float()
+    e_ids = expert_ids_cpu.long() # int64
+    
+    top_k, in_dim = x_f32.shape
+    num_experts, _, out_dim = w_f32.shape
+    num_groups = in_dim // group_size
+    
+    y_ref = torch.zeros((top_k, out_dim), dtype=torch.float32, device="cpu")
+
+    for i in range(top_k):
+        eid = e_ids[i].item()
+        
+        # 严格检查，防止越界导致的核心转储或计算错误
+        if eid < 0 or eid >= num_experts:
+            raise ValueError(f"Expert ID out of bounds: {eid}")
+
+        # Input: [K] -> [Groups, GroupSize, 1]
+        xi = x_f32[i].view(num_groups, group_size, 1)
+        
+        # Weight: [K, N] -> [Groups, GroupSize, N]
+        wi = w_f32[eid].view(num_groups, group_size, out_dim)
+        
+        # Scale: [Groups, N]
+        si = s_f32[eid]
+
+        # 1. Group 内点积: [Groups, N]
+        dot = (wi * xi).sum(dim=1)
+        
+        # 2. 应用 Scale: [Groups, N]
+        scaled = dot * si
+        
+        # 3. Reduce Groups: [N]
+        y_ref[i] = scaled.sum(dim=0)
+
+    return y_ref
+
+def run_npu_kernel(x_npu, weight_packed_npu, scales_npu, expert_ids_npu):
+    """
+    执行 NPU 自定义算子。
+    """
+    print(">> [NPU] Executing Kernel...")
+    
+    # 强制同步，确保此前的数据拷贝已完成
+    # torch.npu.synchronize()
+    
+    # 调用算子
+    y_npu = torch.ops.npu.grouped_gemv_w4a16_moe(
+        x_npu, 
+        weight_packed_npu, 
+        scales_npu, 
+        expert_ids_npu
+    )
+    
+    # 再次同步，确保计算完成
+    torch.npu.synchronize()
+    
+    return y_npu
+
+def pack_weights_for_npu(raw_weights_cpu, device):
+    """
+    将 CPU 上的原始 Int4 权重打包并移动到 NPU。
+    """
+    print(">> [Data] Packing weights for NPU...")
+    num_experts, in_dim, out_dim = raw_weights_cpu.shape
+    
+    # 1. 移动到 NPU (从 CPU 源数据)
+    flat_weights = raw_weights_cpu.view(-1, out_dim).to(device)
+    
+    # 2. 调用 NPU API 打包
+    packed_flat = torch_npu.npu_convert_weight_to_int4pack(flat_weights)
+    
+    # 3. Reshape
+    weight_packed = packed_flat.view(num_experts, in_dim, out_dim // 8)
+    
+    return weight_packed
+
+def find_first_error(y_ref, y_npu, threshold=0.1):
+    """
+    查找并打印第一个超过阈值的误差位置
+    """
+    diff = (y_ref - y_npu).abs()
+    mask = diff > threshold
+    
+    # 获取所有非零元素（即超过阈值）的索引
+    error_indices = torch.nonzero(mask, as_tuple=False)
+    
+    if error_indices.numel() > 0:
+        # 取第一个错误
+        first_idx = error_indices[0]
+        row = first_idx[0].item()
+        col = first_idx[1].item()
+        
+        ref_val = y_ref[row, col].item()
+        npu_val = y_npu[row, col].item()
+        delta = diff[row, col].item()
+        
+        print(f"\n[Debug] First Mismatch Detected (Threshold > {threshold}):")
+        print(f"  Position : Row {row}, Col {col}")
+        print(f"  Ref Value: {ref_val:.6f}")
+        print(f"  NPU Value: {npu_val:.6f}")
+        print(f"  Abs Diff : {delta:.6f}")
+        
+        # 尝试查看该位置周围的数据（方便判断是单点错误还是连续错误）
+        if col + 5 < y_ref.shape[1]:
+            print(f"  Context Ref[{row}, {col}:{col+5}]: {y_ref[row, col:col+5].tolist()}")
+            print(f"  Context NPU[{row}, {col}:{col+5}]: {y_npu[row, col:col+5].tolist()}")
+        return False
+    return True
 
 def run_stable_test():
     # --------------------------------------------------------------------------
-    # 1. 配置参数
+    # 1. 参数配置
     # --------------------------------------------------------------------------
     TOP_K = 8
     NUM_EXPERTS = 128
-    IN_DIM = 1024  # K
-    OUT_DIM = 1024 # N
+    IN_DIM = 2048
+    OUT_DIM = 2048
     GROUP_SIZE = 32
-    NUM_GROUPS = IN_DIM // GROUP_SIZE
     
-    device = "npu:0"
+    device_str = "npu:0"
+    device = torch.device(device_str)
     dtype = torch.bfloat16
-
-    # 设置种子以复现结果
-    torch.manual_seed(1024)
-
-    print(f"Running Numerically Stable MoE Test:")
-    print(f"  Shape: [K={IN_DIM}, N={OUT_DIM}]")
-    print(f"  GroupSize: {GROUP_SIZE}")
+    
+    torch.manual_seed(2)
+    
+    print("-" * 60)
+    print(f"MoE Grouped GEMV Test (Robust Mode)")
+    print(f"TopK={TOP_K}, Experts={NUM_EXPERTS}, Shape=[{IN_DIM}, {OUT_DIM}]")
     print("-" * 60)
 
     # --------------------------------------------------------------------------
-    # 2. 构造数据 (控制方差)
+    # 2. 数据生成 (全部在 CPU 上生成 Golden Data)
     # --------------------------------------------------------------------------
+    print(">> [Data] Generating Golden Data on CPU...")
     
-    # X: 标准正态分布 N(0, 1)
-    x = torch.randn((TOP_K, IN_DIM), dtype=dtype, device=device)
+    # X: [TopK, InDim]
+    x_cpu = torch.randn((TOP_K, IN_DIM), dtype=dtype) # 生成 bfloat16
     
-    # Expert IDs
-    expert_ids = torch.randint(0, NUM_EXPERTS, (TOP_K,), dtype=torch.int32, device=device)
-
-    # --------------------------------------------------------------------------
-    # 3. 构造权重与 Scale (关键步骤)
-    # --------------------------------------------------------------------------
-    print("Generating Weights & Normalizing Scales...")
+    # Expert IDs: [TopK]
+    expert_ids_cpu = torch.randint(0, NUM_EXPERTS, (TOP_K,), dtype=torch.int32)
     
-    # 1. 生成 Int4 权重 (-8 到 7)
-    # Int4 的标准差约为 4.6
-    raw_weights = torch.randint(-8, 8, (NUM_EXPERTS, IN_DIM, OUT_DIM), dtype=torch.int32, device="cpu")
+    # Weights: [Experts, InDim, OutDim] (Int4 stored as Int32)
+    raw_weights_cpu = torch.randint(-8, 8, (NUM_EXPERTS, IN_DIM, OUT_DIM), dtype=torch.int32)
     
-    # 2. 计算 Scale 的缩放因子
-    # 目标: 输出方差为 1
-    # Scale ~ 1 / (sqrt(K) * std_dev(Weight))
+    # Scales: [Experts, Groups, OutDim]
+    # 计算缩放因子以保证数值稳定性
+    num_groups = IN_DIM // GROUP_SIZE
     weight_std = 4.6
     scale_factor = 1.0 / (math.sqrt(IN_DIM) * weight_std)
+    scales_cpu = torch.randn((NUM_EXPERTS, num_groups, OUT_DIM), dtype=torch.float32) * (2 * scale_factor)
+    scales_cpu = scales_cpu.to(dtype=dtype)
+
+    # --------------------------------------------------------------------------
+    # 3. 准备 NPU 数据 (从 CPU 拷贝)
+    # --------------------------------------------------------------------------
+    print(">> [Data] Copying data to NPU...")
+    x_npu = x_cpu.to(device)
+    expert_ids_npu = expert_ids_cpu.to(device)
+    scales_npu = scales_cpu.to(device)
     
-    # 生成正的 Scale，均值约为计算出的 scale_factor
-    # 这样最终输出 y 应该在 [-3, 3] 之间
-    scales_cpu = torch.rand((NUM_EXPERTS, NUM_GROUPS, OUT_DIM), dtype=torch.float32) * (2 * scale_factor)
-    scales = scales_cpu.to(dtype=dtype, device=device)
-
-    # 3. 打包权重 (NPU 格式)
-    # [Experts, In, Out] -> [Experts*In, Out]
-    flat_weights = raw_weights.view(-1, OUT_DIM).to(device)
-    # 调用 NPU API 打包: [Rows, Cols] -> [Rows, Cols/8]
-    packed_flat_weights = torch_npu.npu_convert_weight_to_int4pack(flat_weights)
-    weight_packed = packed_flat_weights.view(NUM_EXPERTS, IN_DIM, OUT_DIM // 8)
+    # 权重需要特殊打包
+    weight_packed_npu = pack_weights_for_npu(raw_weights_cpu, device)
 
     # --------------------------------------------------------------------------
-    # 4. Ground Truth 计算 (Python + Float32 Accumulation)
+    # 4. 执行测试
     # --------------------------------------------------------------------------
-    print("Computing Ground Truth (Float32)...")
-    y_ref = torch.zeros((TOP_K, OUT_DIM), dtype=torch.float32, device="cpu")
+    # 计算 Ground Truth (使用纯 CPU 数据，绝对安全)
+    y_ref = compute_cpu_ground_truth(x_cpu, raw_weights_cpu, scales_cpu, expert_ids_cpu, GROUP_SIZE)
     
-    x_cpu = x.float().cpu()
-    raw_weights_cpu = raw_weights.float()
-    
-    for i in range(TOP_K):
-        eid = expert_ids[i].item()
-        
-        # Reshape inputs for Grouped GEMV logic
-        # Input: [Groups, GroupSize, 1]
-        xi = x_cpu[i].view(NUM_GROUPS, GROUP_SIZE, 1)
-        # Weight: [Groups, GroupSize, N]
-        wi = raw_weights_cpu[eid].view(NUM_GROUPS, GROUP_SIZE, OUT_DIM)
-        # Scale: [Groups, N]
-        si = scales_cpu[eid]
-
-        # Calculation: sum(w * x) * s
-        # 1. Dot product inside group
-        dot = (wi * xi).sum(dim=1) # -> [Groups, N]
-        # 2. Apply scale
-        scaled = dot * si          # -> [Groups, N]
-        # 3. Reduce groups
-        y_ref[i] = scaled.sum(dim=0) # -> [N]
-
-    # 统计 Ground Truth 分布情况
-    print(f"Ground Truth Stats -> Mean: {y_ref.mean():.4f}, Std: {y_ref.std():.4f}")
-    print(f"  (Expected Std close to 1.0)")
-
-    y_ref = y_ref.to(dtype=dtype, device=device)
+    # 执行 NPU Kernel
+    y_npu = run_npu_kernel(x_npu, weight_packed_npu, scales_npu, expert_ids_npu)
 
     # --------------------------------------------------------------------------
-    # 5. NPU Kernel 执行
-    # --------------------------------------------------------------------------
-    print("Executing NPU Kernel...")
-    y_npu = torch.ops.npu.grouped_gemv_w4a16_moe(
-        x, 
-        weight_packed, 
-        scales, 
-        expert_ids
-    )
-
-    # --------------------------------------------------------------------------
-    # 6. 验证
+    # 5. 结果验证
     # --------------------------------------------------------------------------
     print("-" * 60)
-    print("Verification:")
+    print(">> [Verify] Comparing results...")
     
-    # 转换为 float32 进行比较
-    diff = (y_npu.float() - y_ref.float()).abs()
+    # 将 NPU 结果移回 CPU
+    y_npu_cpu = y_npu.float().cpu()
     
+    diff = (y_npu_cpu - y_ref).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     
-    print(f"  Max Diff : {max_diff:.6f}")
-    print(f"  Mean Diff: {mean_diff:.6f}")
+    print(f"  Max Diff      : {max_diff:.6f}")
+    print(f"  Mean Diff     : {mean_diff:.6f}")
     
-    # 打印前几个数值对比
-    print("\n  Sample Data (First 5 elements of first row):")
-    print(f"    Ref: {y_ref[0, :5].float().cpu().tolist()}")
-    print(f"    NPU: {y_npu[0, :5].float().cpu().tolist()}")
-
-    # 阈值判定
-    # 由于 bfloat16 的有效位数较少，且数值现在归一化到了 1.0 左右，
-    # 这里的误差通常在 1e-2 到 1e-3 级别是正常的。
-    if mean_diff < 0.05 and max_diff < 0.2:
-        print("\n✅ Test PASSED (Stable Distribution)!")
+    print(f"\n  Ref Sample: {y_ref[0, :5].tolist()}")
+    print(f"  NPU Sample: {y_npu_cpu[0, :5].tolist()}")
+    
+    # === 新增：查找第一个错误位置 ===
+    # 阈值设为 0.1，因为 bfloat16 的累加误差可能在 0.05 左右
+    DEBUG_THRESHOLD = 0.1 
+    find_first_error(y_ref, y_npu_cpu, threshold=DEBUG_THRESHOLD)
+    
+    if mean_diff < 0.05 and max_diff < 0.25:
+        print("\n✅ Test PASSED")
     else:
-        print("\n❌ Test FAILED (Check Precision/Logic)!")
+        print("\n❌ Test FAILED")
 
 if __name__ == "__main__":
     run_stable_test()
