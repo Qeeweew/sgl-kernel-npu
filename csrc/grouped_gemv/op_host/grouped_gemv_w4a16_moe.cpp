@@ -1,6 +1,7 @@
 #include "defines.h"
 #include "grouped_gemv_w4a16_moe_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "aclrtlaunch_grouped_gemv_w4a16_moe.h"
 #include "torch_helper.h"
 
 namespace sglang {
@@ -97,13 +98,11 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
     int32_t block_dim;
     at::Tensor tiling_tensor = get_tiling(block_dim, top_k, in_dim, out_dim, group_size, num_experts);
 
-    at::Tensor workspace_tensor; // Empty
-
     // ----------------------------------------------------------------
     // 4. Kernel Launch
     // ----------------------------------------------------------------
     EXEC_KERNEL_CMD(grouped_gemv_w4a16_moe, block_dim, x_contiguous, weight, scales, expert_ids, y,
-                    workspace_tensor, tiling_tensor);
+                    tiling_tensor);
     
     return y;
 }
