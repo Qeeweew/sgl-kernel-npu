@@ -101,6 +101,7 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
     // ----------------------------------------------------------------
     // 4. Kernel Launch
     // ----------------------------------------------------------------
+    // printf("%p %p %p %p %p", x_contiguous.data_ptr(), weight.data_ptr(), scales.data_ptr(), expert_ids.data_ptr(), y.data_ptr());
     EXEC_KERNEL_CMD(grouped_gemv_w4a16_moe, block_dim, x_contiguous, weight, scales, expert_ids, y,
                     tiling_tensor);
     
