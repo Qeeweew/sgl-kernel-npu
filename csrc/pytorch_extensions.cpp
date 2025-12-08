@@ -83,6 +83,10 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "grouped_gemv_w4a16_moe(Tensor x, Tensor weight, Tensor scales, Tensor expert_ids) "
         "-> Tensor");
 
+    m.def(
+        "gemv_w4a16(Tensor x, Tensor weight, Tensor scales) "
+        "-> Tensor");
+
 #ifdef BUILD_CATLASS_MODULE
     m.def("catlass_matmul_basic(Tensor tensor_a, Tensor tensor_b, Tensor(a!) tensor_c, str? format_mode=None) -> ()");
 #endif
@@ -119,6 +123,8 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("sgmv_shrink", TORCH_FN(sglang::npu_kernel::sgmv_shrink));
 
     m.impl("grouped_gemv_w4a16_moe", TORCH_FN(sglang::npu_kernel::grouped_gemv_w4a16_moe));
+
+    m.impl("gemv_w4a16", TORCH_FN(sglang::npu_kernel::gemv_w4a16));
 
 #ifdef BUILD_CATLASS_MODULE
     m.impl("catlass_matmul_basic", TORCH_FN(sglang::npu_kernel::catlass_matmul_basic));

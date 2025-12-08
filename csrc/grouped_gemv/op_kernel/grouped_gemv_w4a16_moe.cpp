@@ -1,5 +1,4 @@
 #include "kernel_operator.h"
-#include "../op_host/grouped_gemv_w4a16_moe_tiling.h"
 
 using namespace AscendC;
 
@@ -7,7 +6,7 @@ using namespace AscendC;
 // 常量定义
 // -----------------------------------------------------------------------------
 constexpr int32_t BUFFER_NUM = 2;
-constexpr int32_t GROUP_SIZE = 32;    // 量化分组大小
+constexpr int32_t GROUP_SIZE = 32;    // 量化分组大小 (注意：此处沿用原代码硬编码为32)
 constexpr int32_t PACK_RATIO = 8;     // int32 包含 8个 int4
 constexpr int32_t GROUP_TILE = 8;
 
@@ -20,15 +19,15 @@ public:
     __aicore__ inline KernelGroupedGemvW4A16Moe() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, 
-                                GM_ADDR y, GM_ADDR tiling)
+                                GM_ADDR y, 
+                                int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
     {
-        // 1. 解析 Tiling
-        auto tiling_data = reinterpret_cast<__gm__ sglang::npu_kernel::GroupedGemvW4A16MoeTilingData*>(tiling);
-        this->top_k = tiling_data->top_k;
-        this->in_dim = tiling_data->in_dim;
-        this->out_dim = tiling_data->out_dim;
+        // 1. 设置参数 (不再解析 Tiling 数据结构，直接使用标量参数)
+        this->top_k = top_k;
+        this->in_dim = in_dim;
+        this->out_dim = out_dim;
         this->out_dim_packed = out_dim / 8;
-        this->num_experts = tiling_data->num_experts;
+        this->num_experts = num_experts;
         this->num_groups = this->in_dim / GROUP_SIZE;
         
         // 2. 初始化 GM 指针
@@ -45,8 +44,6 @@ public:
         pipe.InitBuffer(outQueueY, BUFFER_NUM, out_dim * sizeof(float));
 
         // 4. 初始化 Workspace (calcBuf) 并预计算 Offset
-        // 必须保证每个 Offset 都是 32 字节对齐。
-        // out_dim=256, GROUP_SIZE=32，最小的数据块是 x_half (32*2=64B)，均满足对齐。
         uint32_t current_offset = 0;
 
         // Group Accumulator (float)
@@ -75,7 +72,8 @@ public:
 
     __aicore__ inline void Process()
     {
-        // for (int32_t task_idx = GetBlockIdx(); task_idx < total_tasks; task_idx += GetBlockNum()) {
+        // 计算当前 Core 需要处理的任务
+        // 假设 BlockDim 设置为 Core 数量，且任务按行划分
         const int32_t row_idx = GetBlockIdx() % top_k;
         const int32_t expert_id = expertIdsGm.GetValue(row_idx);
         const int32_t g_idx = GetBlockIdx() / top_k;
@@ -83,7 +81,6 @@ public:
         const int32_t n_start = 0;
 
         // 1. 获取并初始化 Global Accumulator
-        // 使用 GetWithOffset 获取指定内存区域
         outQueueY.AllocTensor<T>(y_local);
         auto global_acc = y_local.template ReinterpretCast<float>();
         Duplicate(global_acc, 0.0f, out_dim);
@@ -91,7 +88,7 @@ public:
         // 2. 循环遍历 Groups
         for (int32_t g = g_idx; g < num_groups; g += g_count) {
             CopyIn(expert_id, row_idx, g, n_start);
-            Compute(global_acc); // 将 global_acc 传给 Compute 进行累加
+            Compute(global_acc); 
         }
 
         outQueueY.EnQue(y_local);
@@ -132,8 +129,6 @@ private:
 
     __aicore__ inline void Compute(LocalTensor<float>& global_acc)
     {
-
-        // 使用 GetWithOffset 获取 Workspace 中的临时 Tensor
         LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(out_dim, offset_group_acc);
         LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * out_dim, offset_w_half);
         LocalTensor<float> x_float_tmp = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
@@ -145,20 +140,19 @@ private:
         // 1. 类型转换
         inQueueX.DeQue<T>(x_local);
 
-        // X: bf16 -> float -> half
+        // X: T -> float -> half
+        // 注意：根据 T 是 half 还是 bfloat16，Cast 参数可能不同，这里依赖 AscendC 重载
         Cast(x_float_tmp, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
         Cast(x_half, x_float_tmp, RoundMode::CAST_RINT, GROUP_SIZE);
         inQueueScale.DeQue<T>(s_local);
 
-        // Scale: bf16 -> float
+        // Scale: T -> float
         Cast(s_float, s_local, RoundMode::CAST_NONE, out_dim);
 
         inQueueW.DeQue<int32_t>(w_local);
 
         // Weight: int32 -> int4b -> half
-
         for (int i = 0; i < GROUP_SIZE; i += GROUP_TILE) {
-
             LocalTensor<int4b_t> w_int4 = w_local[i * out_dim_packed].ReinterpretCast<int4b_t>();
             Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * out_dim);
 
@@ -173,7 +167,6 @@ private:
                 Axpy(group_acc, w_half[i * out_dim], x_buf[i], out_dim);
             }
         }
-
 
         // 3. 应用 Scale 并累加到 Global
         MulAddDst(global_acc, group_acc, s_float, out_dim);
@@ -200,9 +193,7 @@ private:
     AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale;
     AscendC::TQue<AscendC::TPosition::VECOUT, 0> outQueueY;
     
-    // 统一管理计算缓冲区
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
-    // 缓冲区内的偏移量变量
     uint32_t offset_group_acc;
     uint32_t offset_w_half;
     uint32_t offset_x_float;
@@ -220,7 +211,6 @@ private:
     LocalTensor<T> y_local;
     LocalTensor<int32_t> w_local;
 
-
     int32_t top_k;
     int32_t in_dim;
     int32_t out_dim;
@@ -229,12 +219,24 @@ private:
     int32_t num_groups;
 };
 
-extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, 
-    GM_ADDR y, GM_ADDR tiling)
+// 导出 FP16 版本
+extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, GM_ADDR y, 
+    int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    KernelGroupedGemvW4A16Moe<half> op;
+    op.Init(x, weight, scales, expert_ids, y, top_k, in_dim, out_dim, num_experts);
+    op.Process();
+}
+
+// 导出 BF16 版本
+extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_bf16(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, GM_ADDR y, 
+    int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     KernelGroupedGemvW4A16Moe<bfloat16_t> op;
-    op.Init(x, weight, scales, expert_ids, y, tiling);
+    op.Init(x, weight, scales, expert_ids, y, top_k, in_dim, out_dim, num_experts);
     op.Process();
 }

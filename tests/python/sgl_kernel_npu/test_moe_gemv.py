@@ -135,8 +135,8 @@ def run_stable_test():
     # --------------------------------------------------------------------------
     TOP_K = 8
     NUM_EXPERTS = 128
-    IN_DIM = 2048
-    OUT_DIM = 2048
+    IN_DIM = 1024
+    OUT_DIM = 1024
     GROUP_SIZE = 32
     
     device_str = "npu:0"

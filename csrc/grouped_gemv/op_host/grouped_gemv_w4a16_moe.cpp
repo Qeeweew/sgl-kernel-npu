@@ -1,35 +1,13 @@
 #include "defines.h"
-#include "grouped_gemv_w4a16_moe_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "aclrtlaunch_grouped_gemv_w4a16_moe.h"
+#include "aclrtlaunch_grouped_gemv_w4a16_moe_fp16.h"
+#include "aclrtlaunch_grouped_gemv_w4a16_moe_bf16.h"
 #include "torch_helper.h"
 
 namespace sglang {
 namespace npu_kernel {
 
 constexpr uint32_t PADDING_BYTE = 32U;
-
-at::Tensor get_tiling(int32_t &block_dim, int32_t top_k, int32_t in_dim, int32_t out_dim, 
-                      int32_t group_size, int32_t num_experts)
-{
-    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
-    // Use AIV cores (Vector Units)
-    block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
-    
-    // align to 32 bytes
-    int32_t tiling_size = (sizeof(GroupedGemvW4A16MoeTilingData) + PADDING_BYTE - 1) / PADDING_BYTE * PADDING_BYTE;
-    auto tiling_buffer = at::empty({tiling_size}, at::TensorOptions().dtype(at::kByte).device(at::kCPU));
-
-    GroupedGemvW4A16MoeTilingData *tiling_data = reinterpret_cast<GroupedGemvW4A16MoeTilingData *>(tiling_buffer.data_ptr());
-    tiling_data->top_k = top_k;
-    tiling_data->in_dim = in_dim;
-    tiling_data->out_dim = out_dim;
-    tiling_data->group_size = group_size;
-    tiling_data->num_experts = num_experts;
-
-    auto tiling_tensor = TorchNpuHepler::CopyTensorHostToDevice(tiling_buffer);
-    return tiling_tensor;
-}
 
 HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Tensor &weight,
                                            const at::Tensor &scales, const at::Tensor &expert_ids)
@@ -90,21 +68,46 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
         x_contiguous = x_in.contiguous();
     }
 
+    bool is_fp16 = (x_in.dtype() == at::kHalf);
+    bool is_bf16 = (x_in.dtype() == at::kBFloat16);
+    TORCH_CHECK(is_fp16 || is_bf16, "x must be float16 or bfloat16");
+
     // ----------------------------------------------------------------
     // 3. Prepare Output & Tiling
     // ----------------------------------------------------------------
-    at::Tensor y = at::empty({top_k, out_dim}, x_in.options());
+    at::Tensor y = at::zeros({top_k, out_dim}, x_in.options());
     
-    int32_t block_dim;
-    at::Tensor tiling_tensor = get_tiling(block_dim, top_k, in_dim, out_dim, group_size, num_experts);
+    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+    int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
+
+    // 获取 Stream
+    auto acl_stream = c10_npu::getCurrentNPUStream();
 
     // ----------------------------------------------------------------
-    // 4. Kernel Launch
+    // 4. Kernel Launch (直接传参，不传 Tiling Tensor)
     // ----------------------------------------------------------------
-    // printf("%p %p %p %p %p", x_contiguous.data_ptr(), weight.data_ptr(), scales.data_ptr(), expert_ids.data_ptr(), y.data_ptr());
-    EXEC_KERNEL_CMD(grouped_gemv_w4a16_moe, block_dim, x_contiguous, weight, scales, expert_ids, y,
-                    tiling_tensor);
-    
+    if (is_fp16) {
+        ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_fp16)
+        (block_dim, acl_stream,
+         const_cast<void *>(x_contiguous.data_ptr()),
+         const_cast<void *>(weight.data_ptr()),
+         const_cast<void *>(scales.data_ptr()),
+         const_cast<void *>(expert_ids.data_ptr()),
+         y.data_ptr(),
+         top_k, in_dim, out_dim, num_experts
+        );
+    } else { // BF16
+        ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_bf16)
+        (block_dim, acl_stream,
+         const_cast<void *>(x_contiguous.data_ptr()),
+         const_cast<void *>(weight.data_ptr()),
+         const_cast<void *>(scales.data_ptr()),
+         const_cast<void *>(expert_ids.data_ptr()),
+         y.data_ptr(),
+         top_k, in_dim, out_dim, num_experts
+        );
+    }
+
     return y;
 }
 

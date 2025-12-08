@@ -17,6 +17,9 @@ at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
 at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Tensor &weight,
                                   const at::Tensor &scales, const at::Tensor &expert_ids);
 
+at::Tensor gemv_w4a16(const at::Tensor &x_in, const at::Tensor &weight,
+                      const at::Tensor &scales);
+
 at::Tensor cache_loc_assign(const at::Tensor &req_indices,
                             const at::Tensor &token_pool,
                             const at::Tensor &start_offset,
