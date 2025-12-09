@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "zero_out_impl.h" // 新增包含
 
 using namespace AscendC;
 
@@ -13,9 +14,10 @@ class KernelGemvW4A16 {
 public:
     __aicore__ inline KernelGemvW4A16() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR y, 
+    __aicore__ inline void Init(AscendC::TPipe* pipe, GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR y, 
                                 int32_t in_dim, int32_t out_dim)
     {
+        this->pipe = pipe;
         this->in_dim = in_dim;
         this->out_dim = out_dim;
         this->num_groups = in_dim / GROUP_SIZE;
@@ -46,10 +48,10 @@ public:
         yGm.SetGlobalBuffer((__gm__ T *)y);
 
         // 3. Pipe Init
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T));
-        pipe.InitBuffer(inQueueW, BUFFER_NUM, GROUP_SIZE * (TILE_N / PACK_RATIO) * sizeof(int32_t));
-        pipe.InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float));
+        pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T));
+        pipe->InitBuffer(inQueueW, BUFFER_NUM, GROUP_SIZE * (TILE_N / PACK_RATIO) * sizeof(int32_t));
+        pipe->InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
+        pipe->InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float));
 
         // 4. Workspace Init
         uint32_t calc_size = 0;
@@ -70,7 +72,7 @@ public:
         this->offset_temp_acc = calc_size;
         calc_size += TILE_N * sizeof(float);
 
-        pipe.InitBuffer(calcBuf, calc_size);
+        pipe->InitBuffer(calcBuf, calc_size);
     }
 
     __aicore__ inline void Process()
@@ -148,7 +150,7 @@ private:
 
         // X Cast
         Cast(x_float_tmp, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
-        Cast(x_half, x_float_tmp, RoundMode::CAST_RINT, GROUP_SIZE);
+        Cast(x_half, x_float_tmp, RoundMode::CAST_ROUND, GROUP_SIZE);
 
         // Scale Cast
         Cast(s_float, s_local, RoundMode::CAST_NONE, tile_n);
@@ -182,7 +184,7 @@ private:
         outQueueY.DeQue<float>(y_acc_local);
         
         LocalTensor<T> y_out = y_acc_local.ReinterpretCast<T>();
-        Cast(y_out, y_acc_local, RoundMode::CAST_RINT, tile_n);
+        Cast(y_out, y_acc_local, RoundMode::CAST_ROUND, tile_n);
         
         PipeBarrier<PIPE_V>();
         
@@ -196,7 +198,7 @@ private:
     }
 
 private:
-    AscendC::TPipe pipe;
+    AscendC::TPipe* pipe;
     AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale;
     AscendC::TQue<AscendC::TPosition::VECOUT, 0> outQueueY;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
@@ -230,8 +232,9 @@ extern "C" __global__ __aicore__ void gemv_w4a16_fp16(
     int32_t in_dim, int32_t out_dim)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::TPipe pipe;
     KernelGemvW4A16<half> op;
-    op.Init(x, weight, scales, y, in_dim, out_dim);
+    op.Init(&pipe, x, weight, scales, y, in_dim, out_dim);
     op.Process();
 }
 
@@ -240,7 +243,8 @@ extern "C" __global__ __aicore__ void gemv_w4a16_bf16(
     int32_t in_dim, int32_t out_dim)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    AscendC::TPipe pipe;
     KernelGemvW4A16<bfloat16_t> op;
-    op.Init(x, weight, scales, y, in_dim, out_dim);
+    op.Init(&pipe, x, weight, scales, y, in_dim, out_dim);
     op.Process();
 }

@@ -2,6 +2,8 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_fp16.h"
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_bf16.h"
+#include "aclrtlaunch_fused_moe_bs1_w4a16_fp16.h"
+#include "aclrtlaunch_fused_moe_bs1_w4a16_bf16.h"
 #include "torch_helper.h"
 
 namespace sglang {
@@ -110,6 +112,80 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
 
     return y;
 }
+
+HOST_API at::Tensor fused_moe_w4a16_bs1(
+    const at::Tensor &x_in, 
+    const at::Tensor &w13_weight, const at::Tensor &w13_scales,
+    const at::Tensor &w2_weight, const at::Tensor &w2_scales,
+    const at::Tensor &expert_ids, const at::Tensor &topk_weights)
+{
+    // 1. Checks (Similar to previous)
+    // x_in: [1, InDim]
+    int32_t top_k = expert_ids.size(0);
+    int32_t in_dim = x_in.numel();
+    int32_t num_experts = w13_weight.size(0);
+    
+    // W13: [E, In, 2*InterPacked]
+    int32_t w13_packed_out = w13_weight.size(2);
+    int32_t inter_dim_2x = w13_packed_out * 8; 
+    int32_t inter_dim = inter_dim_2x / 2;
+
+    // W2: [E, Inter, OutPacked]
+    int32_t out_dim = w2_weight.size(2) * 8;
+
+    // 2. Alloc Output Y
+    // Output shape: [1, OutDim] (Since BS=1 and we sum up)
+    at::Tensor y = at::zeros({1, out_dim}, x_in.options()); // MUST be zeros for AtomicAdd
+
+    // 3. Alloc Workspace
+    // Size = (TopK * 2 * Inter) + (TopK * Inter) elements
+    int64_t w13_out_elems = top_k * inter_dim * 2;
+    int64_t swiglu_out_elems = top_k * inter_dim;
+    int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems;
+    
+    at::Tensor workspace = at::empty({total_workspace_elems}, x_in.options());
+
+    // 4. Launch
+    auto acl_stream = c10_npu::getCurrentNPUStream();
+    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+    int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
+
+    bool is_fp16 = (x_in.dtype() == at::kHalf);
+
+    if (is_fp16) {
+        ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_fp16)(
+            block_dim, acl_stream,
+            const_cast<void *>(x_in.data_ptr()),
+            const_cast<void *>(w13_weight.data_ptr()),
+            const_cast<void *>(w13_scales.data_ptr()),
+            const_cast<void *>(w2_weight.data_ptr()),
+            const_cast<void *>(w2_scales.data_ptr()),
+            const_cast<void *>(expert_ids.data_ptr()),
+            const_cast<void *>(topk_weights.data_ptr()),
+            const_cast<void *>(workspace.data_ptr()),
+            y.data_ptr(),
+            top_k, in_dim, inter_dim, out_dim, num_experts
+        );
+    } else {
+        ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_bf16)(
+            // ... same arguments ...
+            block_dim, acl_stream,
+            const_cast<void *>(x_in.data_ptr()),
+            const_cast<void *>(w13_weight.data_ptr()),
+            const_cast<void *>(w13_scales.data_ptr()),
+            const_cast<void *>(w2_weight.data_ptr()),
+            const_cast<void *>(w2_scales.data_ptr()),
+            const_cast<void *>(expert_ids.data_ptr()),
+            const_cast<void *>(topk_weights.data_ptr()),
+            const_cast<void *>(workspace.data_ptr()),
+            y.data_ptr(),
+            top_k, in_dim, inter_dim, out_dim, num_experts
+        );
+    }
+
+    return y;
+}
+
 
 }  // namespace npu_kernel
 }  // namespace sglang

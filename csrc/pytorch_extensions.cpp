@@ -84,6 +84,10 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "-> Tensor");
 
     m.def(
+        "fused_moe_w4a16_bs1(Tensor x_in, Tensor w13_weight, Tensor w13_scales, Tensor w2_weight, Tensor w2_scales, Tensor expert_ids, Tensor topk_weights) "
+        "-> Tensor");
+
+    m.def(
         "gemv_w4a16(Tensor x, Tensor weight, Tensor scales) "
         "-> Tensor");
 
@@ -123,6 +127,8 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("sgmv_shrink", TORCH_FN(sglang::npu_kernel::sgmv_shrink));
 
     m.impl("grouped_gemv_w4a16_moe", TORCH_FN(sglang::npu_kernel::grouped_gemv_w4a16_moe));
+
+    m.impl("fused_moe_w4a16_bs1", TORCH_FN(sglang::npu_kernel::fused_moe_w4a16_bs1));
 
     m.impl("gemv_w4a16", TORCH_FN(sglang::npu_kernel::gemv_w4a16));
 
