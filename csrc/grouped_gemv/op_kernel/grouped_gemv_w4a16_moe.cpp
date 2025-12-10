@@ -32,8 +32,7 @@ public:
         this->inter_dim = inter_dim;
 
         // Input Queues (T type)
-        pipe->InitBuffer(qGate, BUFFER_NUM, TILE_LEN * sizeof(T));
-        pipe->InitBuffer(qValue, BUFFER_NUM, TILE_LEN * sizeof(T));
+        pipe->InitBuffer(qIn, BUFFER_NUM, 2 * TILE_LEN * sizeof(T));
         
         // Output Queue (T type)
         pipe->InitBuffer(qOut, BUFFER_NUM, TILE_LEN * sizeof(T));
@@ -56,42 +55,42 @@ public:
     }
 
     __aicore__ inline void ComputeRow(int32_t row_idx) {
-        uint64_t gate_offset_base = (uint64_t)row_idx * 2 * inter_dim;
-        uint64_t value_offset_base = gate_offset_base + inter_dim;
+        uint64_t in_offset_base = (uint64_t)row_idx * 2 * inter_dim;
         uint64_t out_offset_base = (uint64_t)row_idx * inter_dim;
 
         for (int32_t i = 0; i < inter_dim; i += TILE_LEN) {
             int32_t len = (inter_dim - i < TILE_LEN) ? (inter_dim - i) : TILE_LEN;
+            DataCopyParams params;
+            params.blockCount = 2;
+            params.blockLen = len * sizeof(T) / 32;
+            params.srcStride = (inter_dim - len) * sizeof(T) / 32;
+            params.dstStride = 0;
             
             // 1. Alloc & CopyIn
-            qGate.AllocTensor<T>(t_gate);
-            qValue.AllocTensor<T>(t_value);
+            qIn.AllocTensor<T>(t_in);
             
-            DataCopy(t_gate, inputGm[gate_offset_base + i], len);
-            DataCopy(t_value, inputGm[value_offset_base + i], len);
+            DataCopy(t_in, inputGm[in_offset_base + i], params);
             
-            qGate.EnQue(t_gate);
-            qValue.EnQue(t_value);
+            qIn.EnQue(t_in);
             
             // 2. Compute
-            qGate.DeQue<T>(t_gate); 
-            qValue.DeQue<T>(t_value);
-            qOut.AllocTensor<T>(t_out);
+            qIn.DeQue(t_in); 
+            qOut.AllocTensor(t_out);
 
             // Get FP32 buffers
-            LocalTensor<float> f_gate = calcBuf.GetWithOffset<float>(TILE_LEN, 0);
-            LocalTensor<float> f_value = calcBuf.GetWithOffset<float>(TILE_LEN, TILE_LEN  * sizeof(float));
+            LocalTensor<float> f_in = calcBuf.GetWithOffset<float>(2 * TILE_LEN, 0);
             LocalTensor<float> f_out = calcBuf.GetWithOffset<float>(TILE_LEN, 2 * TILE_LEN  * sizeof(float));
 
             // Cast T -> FP32
-            Cast(f_gate, t_gate, RoundMode::CAST_NONE, len);
-            Cast(f_value, t_value, RoundMode::CAST_NONE, len);
+            Cast(f_in, t_in, RoundMode::CAST_NONE, 2 * len);
 
-            Silu(f_out, f_gate, len);
-            Mul(f_out, f_out, f_value, len);
+            // f_gate = f_in[0:len]
+            Silu(f_out, f_in, len);
 
-            qGate.FreeTensor(t_gate);
-            qValue.FreeTensor(t_value);
+            // f_value = f_in[len:2*len]
+            Mul(f_out, f_out, f_in[len], len);
+
+            qIn.FreeTensor(t_in);
 
             // Cast FP32 -> T
             Cast(t_out, f_out, RoundMode::CAST_ROUND, len);
@@ -109,10 +108,10 @@ private:
     AscendC::TPipe* pipe;
     AscendC::GlobalTensor<T> inputGm;
     AscendC::GlobalTensor<T> outputGm;
-    AscendC::TQue<AscendC::TPosition::VECIN, 0> qGate, qValue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 0> qIn;
     AscendC::TQue<AscendC::TPosition::VECOUT, 0> qOut;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
-    LocalTensor<T> t_gate, t_value, t_out;
+    LocalTensor<T> t_in, t_out;
     int32_t total_rows;
     int32_t inter_dim;
 };
@@ -144,7 +143,7 @@ public:
         yGm.SetGlobalBuffer((__gm__ T *)y);
 
         if constexpr (IS_WEIGHTED_SUM) {
-            topkWeightsGm.SetGlobalBuffer((__gm__ T *)topk_weights);
+            topkWeightsGm.SetGlobalBuffer((__gm__ float *)topk_weights);
         }
 
         pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
@@ -274,21 +273,15 @@ private:
         // Use a view to manipulate the float values
         LocalTensor<float> y_fp32 = y_local.template ReinterpretCast<float>();
 
-        if constexpr (IS_WEIGHTED_SUM && std::is_same_v<T, bfloat16_t>) {
-            T w_val_t = topkWeightsGm.GetValue(row_idx);
-            float w_val_f = ToFloat(w_val_t);
-            Muls(y_fp32, y_fp32, w_val_f, out_dim);
+        if constexpr (IS_WEIGHTED_SUM) {
+            float w_val = topkWeightsGm.GetValue(row_idx);
+            Muls(y_fp32, y_fp32, w_val, out_dim);
         }
 
         // 4. Cast FP32 -> T
         // Use in-place cast (Float(4B) -> T(2B) fits in same buffer)
         Cast(y_local, y_fp32, RoundMode::CAST_ROUND, out_dim);
 
-        if constexpr (IS_WEIGHTED_SUM && std::is_same_v<T, half>) {
-            T w_val_t = topkWeightsGm.GetValue(row_idx);
-            Muls(y_local, y_local, w_val_t, out_dim);
-        }
-        
         PipeBarrier<PIPE_V>();
 
         if constexpr (IS_WEIGHTED_SUM) {
@@ -310,7 +303,7 @@ private:
 
 private:
     AscendC::TPipe* pipe;
-    AscendC::GlobalTensor<T> topkWeightsGm;
+    AscendC::GlobalTensor<float> topkWeightsGm;
     
     AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale;
     AscendC::TQue<AscendC::TPosition::VECOUT, 0> outQueueY;

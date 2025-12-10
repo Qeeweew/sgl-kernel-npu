@@ -157,7 +157,7 @@ def run_test():
     expert_ids_cpu = torch.randint(0, NUM_EXPERTS, (1, TOP_K), dtype=torch.int32)
     
     # Weights: [1, K] (Normalized for realism)
-    topk_weights_cpu = torch.rand(1, TOP_K, dtype=DTYPE)
+    topk_weights_cpu = torch.rand(1, TOP_K, dtype=torch.float32)
     topk_weights_cpu = topk_weights_cpu / topk_weights_cpu.sum()
 
     # Model Weights (Int4 simulated as Int32 range -8 to 7)

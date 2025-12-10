@@ -151,6 +151,12 @@ HOST_API at::Tensor fused_moe_w4a16_bs1(
     int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
 
     bool is_fp16 = (x_in.dtype() == at::kHalf);
+    bool is_bf16 = (x_in.dtype() == at::kBFloat16);
+    TORCH_CHECK(is_fp16 || is_bf16, "x must be float16 or bfloat16");
+
+    // 检查 topk_weights 必须是 float32 类型
+    TORCH_CHECK(topk_weights.dtype() == at::kFloat, 
+                "topk_weights must be float32, but got ", topk_weights.dtype());
 
     if (is_fp16) {
         ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_fp16)(
@@ -168,7 +174,6 @@ HOST_API at::Tensor fused_moe_w4a16_bs1(
         );
     } else {
         ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_bf16)(
-            // ... same arguments ...
             block_dim, acl_stream,
             const_cast<void *>(x_in.data_ptr()),
             const_cast<void *>(w13_weight.data_ptr()),
