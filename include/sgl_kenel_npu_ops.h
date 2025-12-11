@@ -16,16 +16,15 @@ namespace npu_kernel {
 at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
 
 at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Tensor &weight,
-                                  const at::Tensor &scales, const at::Tensor &expert_ids);
+                                  const at::Tensor &scales, const at::Tensor &offsets, const at::Tensor &expert_ids);
 
 at::Tensor fused_moe_w4a16_bs1(
     const at::Tensor &x_in, 
-    const at::Tensor &w13_weight, const at::Tensor &w13_scales,
-    const at::Tensor &w2_weight, const at::Tensor &w2_scales,
-    const at::Tensor &expert_ids, const at::Tensor &topk_weights);
+    const at::Tensor &w13_weight, const at::Tensor &w13_scales, const at::Tensor &w13_offsets,
+    const at::Tensor &w2_weight, const at::Tensor &w2_scales, const at::Tensor &w2_offsets, const at::Tensor &expert_ids, const at::Tensor &topk_weights);
 
 at::Tensor gemv_w4a16(const at::Tensor &x_in, const at::Tensor &weight,
-                      const at::Tensor &scales);
+                      const at::Tensor &scales, const at::Tensor &offsets);
 
 at::Tensor cache_loc_assign(const at::Tensor &req_indices,
                             const at::Tensor &token_pool,
@@ -58,29 +57,29 @@ void build_tree_efficient(
     const at::Tensor &retrive_next_sibling, int64_t topk, int64_t depth,
     int64_t draft_token_num, int64_t tree_mask_mode);
 
-std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
-mla_preprocess(const at::Tensor &hiddenState, const at::Tensor &gamma0,
-               const at::Tensor &beta0, const at::Tensor &wdqkv,
-               const at::Tensor &descale0, const at::Tensor &gamma1,
-               const at::Tensor &beta1, const at::Tensor &wuq,
-               const at::Tensor &descale1, const at::Tensor &gamma2,
-               const at::Tensor &cos, const at::Tensor &sin,
-               const at::Tensor &wuk, const at::Tensor &kv_cache,
-               const at::Tensor &kv_cache_rope, const at::Tensor &slotmapping,
-               const at::Tensor &quant_scale0, const at::Tensor &quant_offset0,
-               const at::Tensor &bias0, const at::Tensor &quant_scale1,
-               const at::Tensor &quant_offset1, const at::Tensor &bias1,
-               const c10::optional<at::Tensor> &ctkv_scale,
-               const c10::optional<at::Tensor> &q_nope_scale,
-               c10::optional<c10::string_view> cache_mode,
-               c10::optional<c10::string_view> quant_mode, at::Tensor &q_out0,
-               at::Tensor &kv_cache_out0, at::Tensor &q_out1,
-               at::Tensor &kv_cache_out1);
+// std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
+// mla_preprocess(const at::Tensor &hiddenState, const at::Tensor &gamma0,
+//                const at::Tensor &beta0, const at::Tensor &wdqkv,
+//                const at::Tensor &descale0, const at::Tensor &gamma1,
+//                const at::Tensor &beta1, const at::Tensor &wuq,
+//                const at::Tensor &descale1, const at::Tensor &gamma2,
+//                const at::Tensor &cos, const at::Tensor &sin,
+//                const at::Tensor &wuk, const at::Tensor &kv_cache,
+//                const at::Tensor &kv_cache_rope, const at::Tensor &slotmapping,
+//                const at::Tensor &quant_scale0, const at::Tensor &quant_offset0,
+//                const at::Tensor &bias0, const at::Tensor &quant_scale1,
+//                const at::Tensor &quant_offset1, const at::Tensor &bias1,
+//                const c10::optional<at::Tensor> &ctkv_scale,
+//                const c10::optional<at::Tensor> &q_nope_scale,
+//                c10::optional<c10::string_view> cache_mode,
+//                c10::optional<c10::string_view> quant_mode, at::Tensor &q_out0,
+//                at::Tensor &kv_cache_out0, at::Tensor &q_out1,
+//                at::Tensor &kv_cache_out1);
 
-void batch_matmul_transpose(const at::Tensor &tensor_a,
-                            const at::Tensor &tensor_b, at::Tensor &tensor_c,
-                            c10::optional<c10::string_view> format_mode,
-                            c10::optional<c10::string_view> quant_mode);
+// void batch_matmul_transpose(const at::Tensor &tensor_a,
+//                             const at::Tensor &tensor_b, at::Tensor &tensor_c,
+//                             c10::optional<c10::string_view> format_mode,
+//                             c10::optional<c10::string_view> quant_mode);
 
 void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
                               at::Tensor &device_v, at::Tensor &host_v,

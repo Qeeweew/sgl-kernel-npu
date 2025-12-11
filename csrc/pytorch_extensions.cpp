@@ -45,21 +45,21 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor tree_mask, Tensor positions, Tensor retrive_index, Tensor retrive_next_token, "
         "Tensor retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode)->()");
 
-    m.def(
-        "mla_preprocess(Tensor hiddenState, Tensor gamma0, Tensor beta0, Tensor wdqkv, "
-        "Tensor descale0, Tensor gamma1, Tensor beta1, Tensor wuq, "
-        "Tensor descale1, Tensor gamma2, Tensor cos, Tensor sin, Tensor wuk,"
-        "Tensor kv_cache, Tensor kv_cache_rope, Tensor slotmapping, "
-        "Tensor quant_scale0, Tensor quant_offset0, Tensor bias0, "
-        "Tensor quant_scale1, Tensor quant_offset1, Tensor bias1, *, "
-        "Tensor? ctkv_scale=None, Tensor? q_nope_scale=None, "
-        "str? cache_mode=None, str? quant_mode=None, "
-        "Tensor(a!) q_out0, Tensor(b!) kv_cache_out0, Tensor(c!) q_out1, Tensor(d!) kv_cache_out1) "
-        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
+    // m.def(
+    //     "mla_preprocess(Tensor hiddenState, Tensor gamma0, Tensor beta0, Tensor wdqkv, "
+    //     "Tensor descale0, Tensor gamma1, Tensor beta1, Tensor wuq, "
+    //     "Tensor descale1, Tensor gamma2, Tensor cos, Tensor sin, Tensor wuk,"
+    //     "Tensor kv_cache, Tensor kv_cache_rope, Tensor slotmapping, "
+    //     "Tensor quant_scale0, Tensor quant_offset0, Tensor bias0, "
+    //     "Tensor quant_scale1, Tensor quant_offset1, Tensor bias1, *, "
+    //     "Tensor? ctkv_scale=None, Tensor? q_nope_scale=None, "
+    //     "str? cache_mode=None, str? quant_mode=None, "
+    //     "Tensor(a!) q_out0, Tensor(b!) kv_cache_out0, Tensor(c!) q_out1, Tensor(d!) kv_cache_out1) "
+    //     "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
 
-    m.def(
-        "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor(a!) tensor_c, "
-        "str? format_mode=None, str? quant_mode=None) -> ()");
+    // m.def(
+    //     "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor(a!) tensor_c, "
+    //     "str? format_mode=None, str? quant_mode=None) -> ()");
 
     m.def(
         "transfer_kv_dim_exchange(Tensor device_k, Tensor host_k, "
@@ -80,15 +80,15 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "sgmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y, float scale) -> ()");
 
     m.def(
-        "grouped_gemv_w4a16_moe(Tensor x, Tensor weight, Tensor scales, Tensor expert_ids) "
+        "grouped_gemv_w4a16_moe(Tensor x, Tensor weight, Tensor scales, Tensor offsets, Tensor expert_ids) "
         "-> Tensor");
 
     m.def(
-        "fused_moe_w4a16_bs1(Tensor x_in, Tensor w13_weight, Tensor w13_scales, Tensor w2_weight, Tensor w2_scales, Tensor expert_ids, Tensor topk_weights) "
+        "fused_moe_w4a16_bs1(Tensor x_in, Tensor w13_weight, Tensor w13_scales, Tensor w13_offsets, Tensor w2_weight, Tensor w2_scales, Tensor w2_offsets, Tensor expert_ids, Tensor topk_weights) "
         "-> Tensor");
 
     m.def(
-        "gemv_w4a16(Tensor x, Tensor weight, Tensor scales) "
+        "gemv_w4a16(Tensor x, Tensor weight, Tensor scales, Tensor offsets) "
         "-> Tensor");
 
 #ifdef BUILD_CATLASS_MODULE
@@ -112,9 +112,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("build_tree_kernel_efficient", TORCH_FN(sglang::npu_kernel::build_tree_efficient));
 
-    m.impl("mla_preprocess", TORCH_FN(sglang::npu_kernel::mla_preprocess));
+    // m.impl("mla_preprocess", TORCH_FN(sglang::npu_kernel::mla_preprocess));
 
-    m.impl("batch_matmul_transpose", TORCH_FN(sglang::npu_kernel::batch_matmul_transpose));
+    // m.impl("batch_matmul_transpose", TORCH_FN(sglang::npu_kernel::batch_matmul_transpose));
 
     m.impl("transfer_kv_dim_exchange", TORCH_FN(sglang::npu_kernel::transfer_kv_dim_exchange));
 

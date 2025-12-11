@@ -5,10 +5,11 @@
 using namespace AscendC;
 
 // -----------------------------------------------------------------------------
-// 常量定义
+// Constants
 // -----------------------------------------------------------------------------
 constexpr int32_t BUFFER_NUM = 2;
-constexpr int32_t GROUP_SIZE = 32;
+constexpr int32_t GROUP_SIZE = 128; // Updated to 128
+constexpr int32_t COMPUTE_ROWS = 32; // Block size for Weight loading within a group
 constexpr int32_t PACK_RATIO = 8;
 constexpr int32_t GROUP_TILE = 8;
 
@@ -124,21 +125,22 @@ class KernelGroupedGemvW4A16Moe {
 public:
     __aicore__ inline KernelGroupedGemvW4A16Moe() {}
 
-    __aicore__ inline void Init(AscendC::TPipe* pipe, GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, 
-                                GM_ADDR y, GM_ADDR topk_weights,
+    __aicore__ inline void Init(AscendC::TPipe* pipe, GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets,
+                                GM_ADDR expert_ids, GM_ADDR y, GM_ADDR topk_weights,
                                 int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
     {
         this->pipe = pipe;
         this->top_k = top_k;
         this->in_dim = in_dim;
         this->out_dim = out_dim;
-        this->out_dim_packed = out_dim / 8;
+        this->out_dim_packed = out_dim / PACK_RATIO;
         this->num_experts = num_experts;
         this->num_groups = this->in_dim / GROUP_SIZE;
         
         xGm.SetGlobalBuffer((__gm__ T *)x);
         weightGm.SetGlobalBuffer((__gm__ int32_t *)weight);
         scalesGm.SetGlobalBuffer((__gm__ T *)scales);
+        zerosGm.SetGlobalBuffer((__gm__ T *)offsets);
         expertIdsGm.SetGlobalBuffer((__gm__ int32_t *)expert_ids);
         yGm.SetGlobalBuffer((__gm__ T *)y);
 
@@ -146,17 +148,27 @@ public:
             topkWeightsGm.SetGlobalBuffer((__gm__ float *)topk_weights);
         }
 
+        // Pipe Init
+        // X: One group per load
         pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
-        pipe->InitBuffer(inQueueW, BUFFER_NUM, GROUP_SIZE * out_dim_packed * sizeof(int32_t));
+        
+        // W: Tiled loading (COMPUTE_ROWS) to support large GROUP_SIZE(128) without exceeding UB
+        pipe->InitBuffer(inQueueW, BUFFER_NUM, COMPUTE_ROWS * out_dim_packed * sizeof(int32_t));
+        
         pipe->InitBuffer(inQueueScale, BUFFER_NUM, out_dim * sizeof(T));
-        pipe->InitBuffer(outQueueY, BUFFER_NUM, out_dim * sizeof(float)); // Accumulator is Float
+        pipe->InitBuffer(inQueueOffset, BUFFER_NUM, out_dim * sizeof(T));
+        pipe->InitBuffer(outQueueY, BUFFER_NUM, out_dim * sizeof(float)); 
 
+        // Workspace CalcBuf calculation
         uint32_t current_offset = 0;
         this->offset_group_acc = current_offset; current_offset += out_dim * sizeof(float);
         this->offset_w_half = current_offset; current_offset += GROUP_TILE * out_dim * sizeof(half);
         this->offset_x_float = current_offset; current_offset += GROUP_SIZE * sizeof(float);
         this->offset_x_half = current_offset; current_offset += GROUP_SIZE * sizeof(half);
         this->offset_s_float = current_offset; current_offset += out_dim * sizeof(float);
+        this->offset_z_float = current_offset; current_offset += out_dim * sizeof(float);
+        this->offset_reduce_buf = current_offset; current_offset += GROUP_SIZE * sizeof(float);
+        
         pipe->InitBuffer(calcBuf, current_offset);
     }
 
@@ -164,51 +176,46 @@ public:
     {
         const int32_t row_idx = GetBlockIdx() % top_k;
         const int32_t expert_id = expertIdsGm.GetValue(row_idx);
+        // Task allocation: Parallelize over Groups, but limited to TopK blocks
         const int32_t g_idx = GetBlockIdx() / top_k;
         const int32_t g_count = GetBlockNum() / top_k + ((row_idx < GetBlockNum() % top_k) ? 1 : 0);
-        const int32_t n_start = 0; // Simplified for BS=1
-
-        // 1. Alloc Global Acc
-        outQueueY.AllocTensor<T>(y_local); // Effectively holding float data
+        
+        // Output Accumulator (Global to this core's task)
+        outQueueY.AllocTensor<T>(y_local); 
         auto global_acc = y_local.template ReinterpretCast<float>();
         Duplicate(global_acc, 0.0f, out_dim);
 
         for (int32_t g = g_idx; g < num_groups; g += g_count) {
-            CopyIn(expert_id, row_idx, g, n_start);
-            Compute(global_acc); 
+            CopyIn(expert_id, row_idx, g);
+            Compute(g, expert_id, global_acc); 
         }
 
         outQueueY.EnQue(y_local);
-        CopyOut(row_idx, n_start);
+        CopyOut(row_idx);
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t expert_id, int32_t row_idx, int32_t group_idx, int32_t n_start)
+    __aicore__ inline void CopyIn(int32_t expert_id, int32_t row_idx, int32_t group_idx)
     {
-        uint64_t w_stride_k = this->out_dim / PACK_RATIO;
-        uint64_t w_offset = (uint64_t)expert_id * this->in_dim * w_stride_k + 
-                            (uint64_t)group_idx * GROUP_SIZE * w_stride_k + 
-                            (n_start / PACK_RATIO);
+        // 1. Load Scale & Offset (Zeros)
+        // [Experts, Groups, OutDim]
+        uint64_t sz_offset = (uint64_t)expert_id * this->num_groups * this->out_dim +
+                            (uint64_t)group_idx * this->out_dim;
         
-        inQueueW.AllocTensor<int32_t>(w_local);
-        AscendC::DataCopyExtParams w_copy_params{GROUP_SIZE, (uint32_t) (out_dim_packed * sizeof(int32_t)), (uint32_t) ((w_stride_k - out_dim_packed) * sizeof(int32_t)), 0, 0};
-        AscendC::DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
-        DataCopyPad(w_local, weightGm[w_offset], w_copy_params, padParams);
-        inQueueW.EnQue(w_local);
-
-        uint64_t s_offset = (uint64_t)expert_id * this->num_groups * this->out_dim +
-                            (uint64_t)group_idx * this->out_dim + n_start;
         inQueueScale.AllocTensor<T>(s_local);
-        DataCopy(s_local, scalesGm[s_offset], out_dim);
+        inQueueOffset.AllocTensor<T>(z_local);
+        
+        DataCopy(s_local, scalesGm[sz_offset], out_dim);
+        DataCopy(z_local, zerosGm[sz_offset], out_dim);
+        
         inQueueScale.EnQue(s_local);
+        inQueueOffset.EnQue(z_local);
 
-        // ... (X Loading Logic) ...
+        // 2. Load X (One Group)
         uint64_t x_offset;
         if constexpr (IS_BROADCAST_X) {
-            // Broadcast mode: always read from first row (assuming X is [1, InDim])
             x_offset = group_idx * GROUP_SIZE;
         } else {
-            // Normal mode
             x_offset = (uint64_t)row_idx * this->in_dim + group_idx * GROUP_SIZE;
         }
 
@@ -217,60 +224,95 @@ private:
         inQueueX.EnQue(x_local);
     }
 
-    __aicore__ inline void Compute(LocalTensor<float>& global_acc)
+    // Helper to load a chunk of W
+    __aicore__ inline void CopyInW(int32_t expert_id, int32_t group_idx, int32_t k_inner_start)
     {
-        LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(out_dim, offset_group_acc);
-        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * out_dim, offset_w_half);
-        LocalTensor<float> x_float_tmp = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
-        LocalTensor<half> x_half = calcBuf.GetWithOffset<half>(GROUP_SIZE, offset_x_half);
-        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(out_dim, offset_s_float);
-
-        Duplicate(group_acc, 0.0f, out_dim);
-
-        // 1. 类型转换
-        inQueueX.DeQue<T>(x_local);
-
-        // X: T -> float -> half
-        Cast(x_float_tmp, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
-        Cast(x_half, x_float_tmp, RoundMode::CAST_ROUND, GROUP_SIZE);
-        inQueueScale.DeQue<T>(s_local);
-
-        // Scale: T -> float
-        Cast(s_float, s_local, RoundMode::CAST_NONE, out_dim);
-
-        inQueueW.DeQue<int32_t>(w_local);
-
-        // Weight: int32 -> int4b -> half
-        for (int i = 0; i < GROUP_SIZE; i += GROUP_TILE) {
-            LocalTensor<int4b_t> w_int4 = w_local[i * out_dim_packed].ReinterpretCast<int4b_t>();
-            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * out_dim);
-
-            half x_buf[GROUP_TILE];
-            for (int j = 0; j < GROUP_TILE; j++) {
-                x_buf[j] = x_half.GetValue(i + j);
-            }
-
-            // 2. 矩阵乘 (Group Level)
-            for (int i1 = 0; i1 < GROUP_TILE; ++i1) {
-                // group_acc += w_row[i] * x_scalar[i]
-                Axpy(group_acc, w_half[i1 * out_dim], x_buf[i1], out_dim);
-            }
-        }
-
-        // 3. 应用 Scale 并累加到 Global
-        MulAddDst(global_acc, group_acc, s_float, out_dim);
-
-        inQueueW.FreeTensor(w_local);
-        inQueueX.FreeTensor(x_local);
-        inQueueScale.FreeTensor(s_local);
+        uint64_t w_stride_k = this->out_dim_packed;
+        // W layout: [Expert, InDim, OutDim/8]
+        // k_idx = group_idx * 128 + k_inner_start
+        uint64_t w_offset = (uint64_t)expert_id * this->in_dim * w_stride_k + 
+                            (uint64_t)(group_idx * GROUP_SIZE + k_inner_start) * w_stride_k;
+        
+        inQueueW.AllocTensor<int32_t>(w_local);
+        // Copy COMPUTE_ROWS * OutDimPacked
+        AscendC::DataCopyExtParams w_copy_params{
+            (uint16_t)COMPUTE_ROWS, 
+            (uint32_t)(out_dim_packed * sizeof(int32_t)), 
+            (uint32_t)((w_stride_k - out_dim_packed) * sizeof(int32_t)), 
+            0, 0
+        };
+        AscendC::DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
+        DataCopyPad(w_local, weightGm[w_offset], w_copy_params, padParams);
+        inQueueW.EnQue(w_local);
     }
 
-    __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_start)
+    __aicore__ inline void Compute(int32_t g_idx, int32_t expert_id, LocalTensor<float>& global_acc)
     {
-        // At this point, y_local holds the data, but it is effectively float accumulator data
-        outQueueY.DeQue<T>(y_local);
+        // Buffers
+        LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(out_dim, offset_group_acc);
+        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * out_dim, offset_w_half);
+        LocalTensor<float> x_float_full = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
+        LocalTensor<half> x_half_full = calcBuf.GetWithOffset<half>(GROUP_SIZE, offset_x_half);
         
-        // Use a view to manipulate the float values
+        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(out_dim, offset_s_float);
+        LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(out_dim, offset_z_float);
+        LocalTensor<float> reduce_buf = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_reduce_buf);
+
+        // 1. Process X (T -> Float -> Half)
+        inQueueX.DeQue<T>(x_local);
+        Cast(x_float_full, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
+        Cast(x_half_full, x_float_full, RoundMode::CAST_ROUND, GROUP_SIZE);
+
+        // 2. Calculate Sum(X) for asymmetric quantization correction
+        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
+        float group_x_sum = reduce_buf.GetValue(0);
+
+        inQueueX.FreeTensor(x_local);
+
+        // 3. Process Scale & Offset
+        inQueueScale.DeQue<T>(s_local);
+        inQueueOffset.DeQue<T>(z_local);
+        Cast(s_float, s_local, RoundMode::CAST_NONE, out_dim);
+        Cast(z_float, z_local, RoundMode::CAST_NONE, out_dim);
+        inQueueScale.FreeTensor(s_local);
+        inQueueOffset.FreeTensor(z_local);
+
+        // 4. Matrix Multiplication Loop (Tiled by COMPUTE_ROWS to save UB)
+        Duplicate(group_acc, 0.0f, out_dim);
+        
+        for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += COMPUTE_ROWS) {
+            CopyInW(expert_id, g_idx, k_inner);
+            inQueueW.DeQue<int32_t>(w_local);
+
+            for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
+                // W: int32 -> int4 -> half
+                LocalTensor<int4b_t> w_int4 = w_local[i * out_dim_packed].ReinterpretCast<int4b_t>();
+                Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * out_dim);
+
+                half x_val_buf[GROUP_TILE];
+                for (int j = 0; j < GROUP_TILE; j++) {
+                    x_val_buf[j] = x_half_full.GetValue(k_inner + i + j);
+                }
+
+                for (int j = 0; j < GROUP_TILE; ++j) {
+                    Axpy(group_acc, w_half[j * out_dim], x_val_buf[j], out_dim);
+                }
+            }
+            inQueueW.FreeTensor(w_local);
+        }
+
+        // 5. Finalize: Y = (X*W) * S + Sum(X) * Z * S
+        // Calc Correction: Z * S
+        Mul(z_float, z_float, s_float, out_dim);
+        // Add Correction: Acc += Sum(X) * (Z*S)
+        Axpy(global_acc, z_float, group_x_sum, out_dim);
+        // Add Main Term: Acc += (X*W) * S
+        MulAddDst(global_acc, group_acc, s_float, out_dim);
+    }
+
+    __aicore__ inline void CopyOut(int32_t row_idx)
+    {
+        outQueueY.DeQue<T>(y_local);
         LocalTensor<float> y_fp32 = y_local.template ReinterpretCast<float>();
 
         if constexpr (IS_WEIGHTED_SUM) {
@@ -278,25 +320,20 @@ private:
             Muls(y_fp32, y_fp32, w_val, out_dim);
         }
 
-        // 4. Cast FP32 -> T
-        // Use in-place cast (Float(4B) -> T(2B) fits in same buffer)
+        // Cast FP32 -> T
         Cast(y_local, y_fp32, RoundMode::CAST_ROUND, out_dim);
 
         PipeBarrier<PIPE_V>();
 
+        // Atomic Add result to global memory
+        AscendC::SetAtomicAdd<T>();
         if constexpr (IS_WEIGHTED_SUM) {
-            // Atomic Add to Global[0]
-            AscendC::SetAtomicAdd<T>();
-            // Write to n_start (effectively offset 0 relative to Y base, broadcasted reduction)
-            DataCopy(yGm[n_start], y_local, out_dim);
-            AscendC::SetAtomicNone();
+            DataCopy(yGm[0], y_local, out_dim);
         } else {
-            // Normal Store
-            AscendC::SetAtomicAdd<T>();
-            uint64_t y_offset = (uint64_t)row_idx * this->out_dim + n_start;
+            uint64_t y_offset = (uint64_t)row_idx * this->out_dim;
             DataCopy(yGm[y_offset], y_local, out_dim);
-            AscendC::SetAtomicNone();
         }
+        AscendC::SetAtomicNone();
 
         outQueueY.FreeTensor(y_local);
     }
@@ -305,21 +342,21 @@ private:
     AscendC::TPipe* pipe;
     AscendC::GlobalTensor<float> topkWeightsGm;
     
-    AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale;
+    AscendC::TQue<AscendC::TPosition::VECIN, 0> inQueueX, inQueueW, inQueueScale, inQueueOffset;
     AscendC::TQue<AscendC::TPosition::VECOUT, 0> outQueueY;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
     
-    uint32_t offset_group_acc, offset_w_half, offset_x_float, offset_x_half, offset_s_float;
+    uint32_t offset_group_acc, offset_w_half, offset_x_float, offset_x_half;
+    uint32_t offset_s_float, offset_z_float, offset_reduce_buf;
 
     AscendC::GlobalTensor<T> xGm;
     AscendC::GlobalTensor<int32_t> weightGm;
     AscendC::GlobalTensor<T> scalesGm;
+    AscendC::GlobalTensor<T> zerosGm;
     AscendC::GlobalTensor<int32_t> expertIdsGm;
     AscendC::GlobalTensor<T> yGm;
 
-    LocalTensor<T> x_local;
-    LocalTensor<T> s_local;
-    LocalTensor<T> y_local;
+    LocalTensor<T> x_local, s_local, z_local, y_local;
     LocalTensor<int32_t> w_local;
 
     int32_t top_k;
@@ -336,8 +373,8 @@ private:
 template<typename T>
 __aicore__ inline void fused_moe_bs1_impl(
     GM_ADDR x, 
-    GM_ADDR w13_weight, GM_ADDR w13_scales, 
-    GM_ADDR w2_weight, GM_ADDR w2_scales,
+    GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,
+    GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
     GM_ADDR workspace, GM_ADDR y,
     int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
@@ -369,7 +406,7 @@ __aicore__ inline void fused_moe_bs1_impl(
     {
         // IS_BROADCAST_X = true, IS_WEIGHTED_SUM = false
         KernelGroupedGemvW4A16Moe<T, true, false> op_w13;
-        op_w13.Init(&pipe, x, w13_weight, w13_scales, expert_ids, w13_out_ptr, nullptr,
+        op_w13.Init(&pipe, x, w13_weight, w13_scales, w13_offsets, expert_ids, w13_out_ptr, nullptr,
                     top_k, in_dim, inter_dim * 2, num_experts);
         op_w13.Process();
     }
@@ -397,7 +434,7 @@ __aicore__ inline void fused_moe_bs1_impl(
     {
         // IS_BROADCAST_X = false, IS_WEIGHTED_SUM = true
         KernelGroupedGemvW4A16Moe<T, false, true> op_w2;
-        op_w2.Init(&pipe, w2_in_ptr, w2_weight, w2_scales, expert_ids, y, topk_weights,
+        op_w2.Init(&pipe, w2_in_ptr, w2_weight, w2_scales, w2_offsets, expert_ids, y, topk_weights,
                    top_k, inter_dim, out_dim, num_experts);
         op_w2.Process();
     }
@@ -407,44 +444,44 @@ __aicore__ inline void fused_moe_bs1_impl(
 // Extern C Entry Points
 // -----------------------------------------------------------------------------
 extern "C" __global__ __aicore__ void fused_moe_bs1_w4a16_fp16(
-    GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w2_weight, GM_ADDR w2_scales,
+    GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,  GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
     int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_bs1_impl<half>(x, w13_weight, w13_scales, w2_weight, w2_scales, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
+    fused_moe_bs1_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
 }
 
 extern "C" __global__ __aicore__ void fused_moe_bs1_w4a16_bf16(
-    GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w2_weight, GM_ADDR w2_scales,
+    GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets, GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
     int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_bs1_impl<bfloat16_t>(x, w13_weight, w13_scales, w2_weight, w2_scales, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
+    fused_moe_bs1_impl<bfloat16_t>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
 }
 
 
 // 导出 FP16 版本
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, GM_ADDR y, 
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
     int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::TPipe pipe;
     KernelGroupedGemvW4A16Moe<half, false, false> op;
-    op.Init(&pipe, x, weight, scales, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
+    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
     op.Process();
 }
 
 // 导出 BF16 版本
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_bf16(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR expert_ids, GM_ADDR y, 
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
     int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::TPipe pipe;
     KernelGroupedGemvW4A16Moe<bfloat16_t, false, false> op;
-    op.Init(&pipe, x, weight, scales, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
+    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
     op.Process();
 }

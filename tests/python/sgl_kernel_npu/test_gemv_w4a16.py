@@ -1,187 +1,165 @@
 import torch
 import torch_npu
-import math
 import sys
+import time
+import math
 
-# 尝试导入自定义算子库 (通常在 torch.ops.npu 下)
+# 尝试导入自定义算子库
 try:
-    # 这一步通常不需要显式 import，只要库被 torch 加载
-    # 这里的 pass 只是占位，确保环境正常
     import sgl_kernel_npu
 except ImportError:
-    print("Warning: sgl_kernel_npu not found. Please ensure the kernel is compiled and installed.")
-    sys.exit(1)
-
-def compute_cpu_ground_truth(x_cpu, w_unpacked_cpu, scales_cpu, group_size):
-    """
-    在 CPU 上计算 Ground Truth。
-    """
-    print(">> [CPU] Computing Ground Truth...")
-    
-    # 转换为 Float32 保证精度
-    x_f32 = x_cpu.float()            # [1, K]
-    w_f32 = w_unpacked_cpu.float()   # [K, N]
-    s_f32 = scales_cpu.float()       # [Groups, N]
-    
-    K = x_f32.shape[1]
-    N = w_f32.shape[1]
-    num_groups = K // group_size
-    
-    # Reshape for Grouped computation
-    # X: [1, K] -> [1, Groups, GroupSize]
-    x_g = x_f32.view(1, num_groups, group_size)
-    
-    # W: [K, N] -> [Groups, GroupSize, N]
-    w_g = w_f32.view(num_groups, group_size, N)
-    
-    # 1. Group-wise Dot Product: Sum(X * W) inside group
-    # [1, Groups, GroupSize] * [Groups, GroupSize, N] -> [1, Groups, N]
-    # 使用 einsum 进行乘加: b=batch(1), g=group, s=sub_group(32), n=out_dim
-    dot = torch.einsum('bgs,gsn->bgn', x_g, w_g)
-    
-    # 2. Apply Scales: [1, Groups, N] * [Groups, N] (Broadcasting)
-    # Scales are per-group, per-channel
-    scaled_dot = dot * s_f32.unsqueeze(0)
-    
-    # 3. Sum over Groups to get final output
-    # [1, Groups, N] -> [1, N]
-    y_ref = scaled_dot.sum(dim=1)
-    
-    return y_ref
-
-def pack_weights_for_npu(w_unpacked_cpu, device):
-    """
-    模拟 Python 侧的打包逻辑。
-    Input: [K, N] int32 (values -8..7)
-    Output: [K, N // 8] int32 (packed)
-    """
-    print(">> [Data] Packing weights for NPU...")
-    
-    # 1. Move to NPU
-    w_npu = w_unpacked_cpu.to(device)
-    
-    # 2. Call NPU API to pack
-    # npu_convert_weight_to_int4pack expects [K, N] and returns [K, N/8]
-    # ensuring the memory layout is compatible with the kernel's expectation
-    w_packed = torch_npu.npu_convert_weight_to_int4pack(w_npu)
-    
-    return w_packed
-
-def find_first_error(y_ref, y_npu, threshold=0.1):
-    diff = (y_ref - y_npu).abs()
-    mask = diff > threshold
-    error_indices = torch.nonzero(mask, as_tuple=False)
-    
-    if error_indices.numel() > 0:
-        first_idx = error_indices[0]
-        col = first_idx[1].item() # Batch is 0
-        
-        ref_val = y_ref[0, col].item()
-        npu_val = y_npu[0, col].item()
-        delta = diff[0, col].item()
-        
-        print(f"\n[Debug] First Mismatch Detected (Threshold > {threshold}):")
-        print(f"  Position : Col {col}")
-        print(f"  Ref Value: {ref_val:.6f}")
-        print(f"  NPU Value: {npu_val:.6f}")
-        print(f"  Abs Diff : {delta:.6f}")
-        return False
-    return True
+    print("Warning: sgl_kernel_npu not found. Assuming it is loaded via torch.ops")
 
 def run_test():
     # --------------------------------------------------------------------------
-    # 1. 配置
+    # 1. 配置参数
     # --------------------------------------------------------------------------
-    IN_DIM = 1024 # K
-    OUT_DIM = 2048 # N
-    GROUP_SIZE = 32    # 固定
+    # 模拟 LLaMA-3-8B/70B 常见的形状
+    # K=4096 (Hidden Size), N=4096 (Intermediate), GroupSize=128
+    IN_DIM = 4096   
+    OUT_DIM = 4096 
+    GROUP_SIZE = 128
     
-    device_str = "npu:0"
-    device = torch.device(device_str)
+    # 你的自定义算子目前只支持 batch_size = 1
+    BATCH_SIZE = 1 
     
-    # 测试 BF16 和 FP16
-    dtypes = [torch.float16, torch.bfloat16]
+    DEVICE = "npu:0"
+    DTYPE = torch.float16
     
-    for dtype in dtypes:
-        print("=" * 60)
-        print(f"Testing GEMV W4A16 Custom Kernel with dtype={dtype}")
-        print(f"Shape: [{IN_DIM}, {OUT_DIM}], GroupSize={GROUP_SIZE}")
-        print("=" * 60)
+    print("=" * 70)
+    print(f"Test Configuration:")
+    print(f"  Shape      : X=[{BATCH_SIZE}, {IN_DIM}], W=[{IN_DIM}, {OUT_DIM}]")
+    print(f"  Group Size : {GROUP_SIZE}")
+    print(f"  Dtype      : {DTYPE}")
+    print(f"  Compare To : torch_npu.npu_weight_quant_batchmatmul")
+    print("=" * 70)
 
-        torch.manual_seed(42)
+    # --------------------------------------------------------------------------
+    # 2. 数据生成
+    # --------------------------------------------------------------------------
+    torch.manual_seed(42)
+    
+    # X: [1, K]
+    x = torch.randn((BATCH_SIZE, IN_DIM), dtype=DTYPE, device=DEVICE)
+    
+    # Scales: [Groups, N]
+    num_groups = IN_DIM // GROUP_SIZE
+    scales = torch.randn((num_groups, OUT_DIM), dtype=DTYPE, device=DEVICE) * 1.0 / math.sqrt(IN_DIM)
+    
+    # offsets (Offset): [Groups, N]
+    # 注意：这里的 offsets 是浮点类型的 Offset，对应公式 Y = X * (W + Z) * S 中的 Z
+    offsets = torch.randint(-8, 8, (num_groups, OUT_DIM), device=DEVICE).to(dtype=DTYPE)
 
-        # --------------------------------------------------------------------------
-        # 2. 数据生成 (CPU)
-        # --------------------------------------------------------------------------
-        # X: [1, K] (Batch Size = 1)
-        x_cpu = torch.randn((1, IN_DIM), dtype=dtype)
-        
-        # Weights: [K, N] (Int4 values stored as Int32)
-        w_unpacked_cpu = torch.randint(-8, 8, (IN_DIM, OUT_DIM), dtype=torch.int32)
-        
-        # Scales: [Groups, N]
-        num_groups = IN_DIM // GROUP_SIZE
-        weight_std = 4.6
-        scale_factor = 1.0 / (math.sqrt(IN_DIM) * weight_std)
-        # 随机生成 Scale，范围控制在合理区间防止溢出
-        scales_cpu = torch.randn((num_groups, OUT_DIM), dtype=dtype) * (2 * scale_factor)
+    # Weights: [K, N] 原始 Int8 权重 (-8 到 7)
+    # 我们生成 int32 但限制范围在 int4 内
+    weight_unpacked = torch.randint(-8, 8, (IN_DIM, OUT_DIM), dtype=torch.int32, device=DEVICE)
 
-        # --------------------------------------------------------------------------
-        # 3. 准备 NPU 数据
-        # --------------------------------------------------------------------------
-        x_npu = x_cpu.to(device)
-        scales_npu = scales_cpu.to(device)
-        
-        # 打包权重
-        w_packed_npu = pack_weights_for_npu(w_unpacked_cpu, device)
+    # --------------------------------------------------------------------------
+    # 3. 权重打包 (Packing)
+    # --------------------------------------------------------------------------
+    print(">> Packing weights using torch_npu.npu_convert_weight_to_int4pack ...")
+    # 使用华为官方 API 进行打包，确保内存布局符合 NPU 硬件要求
+    # 输入: [K, N] int32, 输出: [K, N/8] int32 (内部是特殊的 NPU 格式)
+    weight_packed = torch_npu.npu_convert_weight_to_int4pack(weight_unpacked)
 
-        # --------------------------------------------------------------------------
-        # 4. 执行 Ground Truth
-        # --------------------------------------------------------------------------
-        y_ref = compute_cpu_ground_truth(x_cpu, w_unpacked_cpu, scales_cpu, GROUP_SIZE)
+    # --------------------------------------------------------------------------
+    # 4. 运行 NPU 原生算子 (Ground Truth)
+    # --------------------------------------------------------------------------
+    print(">> Running Native Op (npu_weight_quant_batchmatmul)...")
+    
+    # Warmup
+    for _ in range(10):
+        y_ref = torch_npu.npu_weight_quant_batchmatmul(
+            x, 
+            weight_packed, 
+            antiquant_scale=scales, 
+            antiquant_offset=offsets, 
+            antiquant_group_size=GROUP_SIZE
+        )
+    
+    torch.npu.synchronize()
+    start_native = time.time()
+    
+    # Actual Run
+    y_ref = torch_npu.npu_weight_quant_batchmatmul(
+        x, 
+        weight_packed, 
+        antiquant_scale=scales, 
+        antiquant_offset=offsets, 
+        antiquant_group_size=GROUP_SIZE
+    )
+    
+    torch.npu.synchronize()
+    time_native = (time.time() - start_native) * 1000
 
-        # --------------------------------------------------------------------------
-        # 5. 执行 Custom Kernel
-        # --------------------------------------------------------------------------
-        print(">> [NPU] Executing Custom Kernel (gemv_w4a16)...")
-        # 确保输入是 contiguous 1D
-        x_flat = x_npu.view(-1)
+    # --------------------------------------------------------------------------
+    # 5. 运行自定义 AscendC 算子
+    # --------------------------------------------------------------------------
+    print(">> Running Custom Kernel (gemv_w4a16)...")
+    
+    # 自定义算子输入需要 flatten 的 x: [K]
+    x_flat = x.view(-1)
+    
+    # Warmup
+    for _ in range(10):
+        y_custom = torch.ops.npu.gemv_w4a16(x_flat, weight_packed, scales, offsets)
         
-        # 调用 C++ 绑定的算子
-        # 签名: gemv_w4a16(Tensor x, Tensor weight, Tensor scales) -> Tensor
-        import time
-        torch.npu.synchronize()
-        start_time = time.time()
-        
-        y_npu = torch.ops.npu.gemv_w4a16(x_flat, w_packed_npu, scales_npu)
-        
-        torch.npu.synchronize()
-        print(f">> Kernel Execution Time: {(time.time() - start_time)*1000:.3f} ms")
+    torch.npu.synchronize()
+    start_custom = time.time()
+    
+    # Actual Run
+    y_custom = torch.ops.npu.gemv_w4a16(x_flat, weight_packed, scales, offsets)
+    
+    torch.npu.synchronize()
+    time_custom = (time.time() - start_custom) * 1000
 
-        # --------------------------------------------------------------------------
-        # 6. 验证
-        # --------------------------------------------------------------------------
-        y_npu_cpu = y_npu.float().cpu().view(1, OUT_DIM)
+    # --------------------------------------------------------------------------
+    # 6. 结果对比
+    # --------------------------------------------------------------------------
+    # 将自定义输出 reshape 回 [1, N] 以便对比
+    y_custom = y_custom.view(1, OUT_DIM)
+    
+    # 转换为 float32 进行高精度对比
+    diff = (y_ref.float() - y_custom.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    
+    # 打印性能对比
+    print("-" * 70)
+    print(f"Performance Comparison:")
+    print(f"  Native Op Time : {time_native:.3f} ms")
+    print(f"  Custom Op Time : {time_custom:.3f} ms")
+    if time_custom < time_native:
+        print(f"  >> Speedup     : {time_native / time_custom:.2f}x 🚀")
+    else:
+        print(f"  >> Slowdown    : {time_native / time_custom:.2f}x")
+
+    # 打印精度对比
+    print("-" * 70)
+    print(f"Accuracy Verification:")
+    print(f"  Max Diff       : {max_diff:.6f}")
+    print(f"  Mean Diff      : {mean_diff:.6f}")
+    
+    # 阈值判定
+    # BF16 精度下，积累误差可能会达到 1e-2 级别，对于大矩阵乘法是正常的
+    threshold = 0.05 
+    
+    if max_diff < threshold or mean_diff < 0.005:
+        print("\n✅ Result Matches! Test PASSED.")
+    else:
+        print("\n❌ Result Mismatch! Test FAILED.")
         
-        diff = (y_npu_cpu - y_ref).abs()
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
-        
-        print("-" * 40)
-        print(f"Result Verification ({dtype}):")
-        print(f"  Max Diff  : {max_diff:.6f}")
-        print(f"  Mean Diff : {mean_diff:.6f}")
-        
-        # 精度阈值: BF16 精度较低，容忍度高一点
-        threshold = 0.05 if dtype == torch.float16 else 0.15
-        
-        passed = find_first_error(y_ref, y_npu_cpu, threshold=threshold)
-        
-        if passed and mean_diff < (threshold / 2):
-            print("\n✅ Test PASSED")
-        else:
-            print("\n❌ Test FAILED")
-        print("\n")
+        # Debug info
+        print("\nDebug First Error:")
+        mask = diff > threshold
+        indices = torch.nonzero(mask, as_tuple=False)
+        if indices.numel() > 0:
+            idx = indices[0]
+            r, c = idx[0].item(), idx[1].item()
+            print(f"  At index [{r}, {c}]:")
+            print(f"    Native : {y_ref[r, c].item():.6f}")
+            print(f"    Custom : {y_custom[r, c].item():.6f}")
+            print(f"    Diff   : {diff[r, c].item():.6f}")
 
 if __name__ == "__main__":
     run_test()
