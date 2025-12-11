@@ -7,7 +7,8 @@ constexpr int32_t BUFFER_NUM = 2;
 constexpr int32_t GROUP_SIZE = 32;     
 constexpr int32_t PACK_RATIO = 8;     
 constexpr int32_t GROUP_TILE = 8;
-constexpr int32_t TILE_N = 1024; // 调整为 1024 确保足够的 Double Buffer 空间和 temp buffer
+constexpr int32_t TILE_N = 2048; // 调整为 1024 确保足够的 Double Buffer 空间和 temp buffer
+constexpr int32_t ALIGN_N = 1024; // N 维度切分对齐要求
 
 template<typename T>
 class KernelGemvW4A16 {
@@ -22,38 +23,82 @@ public:
         this->out_dim = out_dim;
         this->num_groups = in_dim / GROUP_SIZE;
         this->out_dim_packed = out_dim / PACK_RATIO;
-        
-        // 1. Tiling by Groups (Split K)
+        this->n_start = 0; this->n_end = 0;
+        this->g_start = 0; this->g_end = 0;       
+
+        // --- Tiling Strategy Update (2D Splitting) ---
         int32_t core_idx = GetBlockIdx();
         int32_t core_num = GetBlockNum();
 
-        int32_t groups_per_core = this->num_groups / core_num;
-        int32_t remain_groups = this->num_groups % core_num;
+        // 1. Calculate blocks along N dimension
+        // 尽量按 TILE_N 切分，但块数不能超过核心数
+        int32_t n_blocks = (out_dim + TILE_N - 1) / TILE_N;
+        if (n_blocks > core_num) n_blocks = core_num;
 
-        if (core_idx < remain_groups) {
-            groups_per_core += 1;
-            this->g_start = core_idx * groups_per_core;
+        // 2. Determine Grid (N x K)
+        // 每个 N-Block 分配多少个核用于 Split-K (Groups)
+        int32_t cores_per_n = core_num / n_blocks;
+        
+        // 计算当前核属于哪个 N-Block (n_idx) 和 哪个 K-Block (k_idx)
+        int32_t n_idx = core_idx / cores_per_n;
+        int32_t k_idx = core_idx % cores_per_n;
+
+        // 处理核心数无法整除的情况，多余的核心不参与计算 (Inactive)
+        if (n_idx >= n_blocks) {
+            return;
+        }
+
+        // 3. Split N Dimension (Aligned to 256)
+        // 将 out_dim 看作若干个 ALIGN_N 单元
+        int32_t total_aligned_units = (out_dim + ALIGN_N - 1) / ALIGN_N;
+        int32_t units_per_block = total_aligned_units / n_blocks;
+        int32_t remain_units = total_aligned_units % n_blocks;
+
+        int32_t current_units = 0;
+        int32_t start_unit = 0;
+
+        if (n_idx < remain_units) {
+            current_units = units_per_block + 1;
+            start_unit = n_idx * current_units;
         } else {
-            this->g_start = remain_groups * (groups_per_core + 1) + 
-                            (core_idx - remain_groups) * groups_per_core;
+            current_units = units_per_block;
+            start_unit = remain_units * (units_per_block + 1) + (n_idx - remain_units) * units_per_block;
+        }
+
+        this->n_start = start_unit * ALIGN_N;
+        this->n_end = this->n_start + current_units * ALIGN_N;
+        
+        // 修正边界，不能超过 out_dim
+        if (this->n_end > out_dim) this->n_end = out_dim;
+
+        // 4. Split K Dimension (Groups) inside the assigned N-Block
+        // 将 num_groups 分配给 cores_per_n 个核心
+        int32_t groups_per_core = this->num_groups / cores_per_n;
+        int32_t remain_groups_k = this->num_groups % cores_per_n;
+
+        if (k_idx < remain_groups_k) {
+            groups_per_core += 1;
+            this->g_start = k_idx * groups_per_core;
+        } else {
+            this->g_start = remain_groups_k * (groups_per_core + 1) + 
+                            (k_idx - remain_groups_k) * groups_per_core;
         }
         this->g_end = this->g_start + groups_per_core;
         
-        if (this->g_start >= this->g_end) return;
-
-        // 2. GM Init
+        // --- Init Buffers ---
+        // GM Init
         xGm.SetGlobalBuffer((__gm__ T *)x);
         weightGm.SetGlobalBuffer((__gm__ int32_t *)weight);
         scalesGm.SetGlobalBuffer((__gm__ T *)scales);
         yGm.SetGlobalBuffer((__gm__ T *)y);
 
-        // 3. Pipe Init
+        // Pipe Init
         pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T));
         pipe->InitBuffer(inQueueW, BUFFER_NUM, GROUP_SIZE * (TILE_N / PACK_RATIO) * sizeof(int32_t));
         pipe->InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
         pipe->InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float));
 
-        // 4. Workspace Init
+        // Workspace Init
         uint32_t calc_size = 0;
         
         this->offset_w_half = calc_size;
@@ -68,7 +113,6 @@ public:
         this->offset_s_float = calc_size;
         calc_size += TILE_N * sizeof(float);
 
-        // 临时 Buffer 存放当前 Group 的 Raw Sum (W * X)，未乘 Scale 前
         this->offset_temp_acc = calc_size;
         calc_size += TILE_N * sizeof(float);
 
@@ -77,19 +121,18 @@ public:
 
     __aicore__ inline void Process()
     {
-        if (this->g_start >= this->g_end) return;
+        if (this->g_start >= this->g_end || this->n_start >= this->n_end) return;
 
-        // Outer Loop: Split N into Tiles
-        for (int32_t n_offset = 0; n_offset < this->out_dim; n_offset += TILE_N) {
+        // Loop over N tiles within the range assigned to this core [n_start, n_end)
+        for (int32_t n_offset = this->n_start; n_offset < this->n_end; n_offset += TILE_N) {
             
             int32_t current_tile_n = TILE_N;
-            if (n_offset + TILE_N > this->out_dim) {
-                current_tile_n = this->out_dim - n_offset;
+            if (n_offset + TILE_N > this->n_end) { // Check against n_end, not out_dim
+                current_tile_n = this->n_end - n_offset;
             }
-            // Align packed width to 32 bytes roughly, handled by copy params
             int32_t current_tile_n_packed = current_tile_n / PACK_RATIO;
 
-            // Init Accumulator for this Tile (accumulating across groups)
+            // Init Accumulator
             outQueueY.AllocTensor<float>(y_acc_local);
             Duplicate(y_acc_local, 0.0f, current_tile_n);
             
@@ -141,20 +184,18 @@ private:
         LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(tile_n, offset_s_float);
         LocalTensor<float> temp_acc = calcBuf.GetWithOffset<float>(tile_n, offset_temp_acc);
 
-        inQueueX.DeQue<T>(x_local);
-        inQueueW.DeQue<int32_t>(w_local);
-        inQueueScale.DeQue<T>(s_local);
-
-        // Init temp_acc for current group
         Duplicate(temp_acc, 0.0f, tile_n);
+        inQueueX.DeQue<T>(x_local);
 
         // X Cast
         Cast(x_float_tmp, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
         Cast(x_half, x_float_tmp, RoundMode::CAST_ROUND, GROUP_SIZE);
 
+        inQueueScale.DeQue<T>(s_local);
         // Scale Cast
         Cast(s_float, s_local, RoundMode::CAST_NONE, tile_n);
 
+        inQueueW.DeQue<int32_t>(w_local);
         // Compute W * X for current group
         for (int i = 0; i < GROUP_SIZE; i += GROUP_TILE) {
             LocalTensor<int4b_t> w_int4 = w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
@@ -188,8 +229,7 @@ private:
         
         PipeBarrier<PIPE_V>();
         
-        // Atomic Add to Global Memory
-        // 因为我们只计算了部分 Groups 的结果，需要累加到最终的 Y
+        // Atomic Add is still needed because multiple cores might work on same N but different Groups (Split K)
         SetAtomicAdd<T>(); 
         DataCopy(yGm[n_offset], y_out, tile_n);
         SetAtomicNone();
@@ -223,6 +263,10 @@ private:
     int32_t out_dim;
     int32_t num_groups;
     int32_t out_dim_packed;
+    
+    // Tiling Params
+    int32_t n_start;
+    int32_t n_end;
     int32_t g_start;
     int32_t g_end;
 };
