@@ -8,21 +8,24 @@ namespace sglang {
 namespace npu_kernel {
 
 HOST_API at::Tensor gemv_w4a16(const at::Tensor &x_in, const at::Tensor &weight,
-                               const at::Tensor &scales)
+                               const at::Tensor &scales, const at::Tensor &zeros)
 {
     TORCH_CHECK(weight.dtype() == at::kInt, "weight must be int32");
     TORCH_CHECK(x_in.dtype() == scales.dtype(), "x and scales dtype mismatch");
+    TORCH_CHECK(x_in.dtype() == zeros.dtype(), "x and zeros dtype mismatch");
+    
     bool is_fp16 = (x_in.dtype() == at::kHalf);
     
     int32_t in_dim = weight.size(0);
     int32_t out_dim_packed = weight.size(1);
     int32_t out_dim = out_dim_packed * 8;
     
-    // Scale shape check: [Groups, N]
+    // Check shapes
     int32_t num_groups = scales.size(0);
     int32_t group_size = in_dim / num_groups;
     
-    TORCH_CHECK(group_size == 32, "AscendC custom kernel only supports group_size=32");
+    TORCH_CHECK(group_size == 128, "Custom kernel currently optimized for group_size=128");
+    TORCH_CHECK(zeros.size(0) == num_groups && zeros.size(1) == out_dim, "Zeros shape mismatch");
     
     int32_t x_k = x_in.numel();
     TORCH_CHECK(x_k == in_dim, "X numel mismatch with Weight InDim");
@@ -40,6 +43,7 @@ HOST_API at::Tensor gemv_w4a16(const at::Tensor &x_in, const at::Tensor &weight,
          const_cast<void *>(x_contig.data_ptr()),
          const_cast<void *>(weight.data_ptr()),
          const_cast<void *>(scales.data_ptr()),
+         const_cast<void *>(zeros.data_ptr()),
          y.data_ptr(),
          in_dim, out_dim);
     } else {
@@ -48,6 +52,7 @@ HOST_API at::Tensor gemv_w4a16(const at::Tensor &x_in, const at::Tensor &weight,
          const_cast<void *>(x_contig.data_ptr()),
          const_cast<void *>(weight.data_ptr()),
          const_cast<void *>(scales.data_ptr()),
+         const_cast<void *>(zeros.data_ptr()),
          y.data_ptr(),
          in_dim, out_dim);
     }
