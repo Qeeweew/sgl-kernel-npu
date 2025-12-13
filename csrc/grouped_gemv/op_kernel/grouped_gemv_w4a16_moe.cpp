@@ -118,7 +118,7 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// Kernel Grouped Gemv (Enhanced with Templates)
+// Kernel Grouped Gemv (Enhanced with Templates & N-Tiling)
 // -----------------------------------------------------------------------------
 template<typename T, bool IS_BROADCAST_X=false, bool IS_WEIGHTED_SUM=false>
 class KernelGroupedGemvW4A16Moe {
@@ -148,25 +148,33 @@ public:
             topkWeightsGm.SetGlobalBuffer((__gm__ float *)topk_weights);
         }
 
+        // --- N-Tiling Constants ---
+        // 使用 TILE_N (2048) 进行 Buffer 分配，而不是 out_dim
+        constexpr int32_t TILE_N = 2048;
+        int32_t tile_n_packed = TILE_N / PACK_RATIO;
+
         // Pipe Init
-        // X: One group per load
+        // X: One group per load (Invariant to N-tiling)
         pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
         
-        // W: Tiled loading (COMPUTE_ROWS) to support large GROUP_SIZE(128) without exceeding UB
-        pipe->InitBuffer(inQueueW, BUFFER_NUM, COMPUTE_ROWS * out_dim_packed * sizeof(int32_t));
+        // W: Tiled loading (COMPUTE_ROWS * TILE_N_PACKED)
+        // 降低了单次 W 的内存需求
+        pipe->InitBuffer(inQueueW, BUFFER_NUM, COMPUTE_ROWS * tile_n_packed * sizeof(int32_t));
         
-        pipe->InitBuffer(inQueueScale, BUFFER_NUM, out_dim * sizeof(T));
-        pipe->InitBuffer(inQueueOffset, BUFFER_NUM, out_dim * sizeof(T));
-        pipe->InitBuffer(outQueueY, BUFFER_NUM, out_dim * sizeof(float)); 
+        // Scale, Offset, Y: Tiled by TILE_N
+        pipe->InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
+        pipe->InitBuffer(inQueueOffset, BUFFER_NUM, TILE_N * sizeof(T));
+        pipe->InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float)); 
 
         // Workspace CalcBuf calculation
+        // 所有与 N (out_dim) 相关的临时 Buffer 大小都改为 TILE_N
         uint32_t current_offset = 0;
-        this->offset_group_acc = current_offset; current_offset += out_dim * sizeof(float);
-        this->offset_w_half = current_offset; current_offset += GROUP_TILE * out_dim * sizeof(half);
+        this->offset_group_acc = current_offset; current_offset += TILE_N * sizeof(float);
+        this->offset_w_half = current_offset; current_offset += GROUP_TILE * TILE_N * sizeof(half);
         this->offset_x_float = current_offset; current_offset += GROUP_SIZE * sizeof(float);
         this->offset_x_half = current_offset; current_offset += GROUP_SIZE * sizeof(half);
-        this->offset_s_float = current_offset; current_offset += out_dim * sizeof(float);
-        this->offset_z_float = current_offset; current_offset += out_dim * sizeof(float);
+        this->offset_s_float = current_offset; current_offset += TILE_N * sizeof(float);
+        this->offset_z_float = current_offset; current_offset += TILE_N * sizeof(float);
         this->offset_reduce_buf = current_offset; current_offset += GROUP_SIZE * sizeof(float);
         
         pipe->InitBuffer(calcBuf, current_offset);
@@ -176,42 +184,38 @@ public:
     {
         const int32_t row_idx = GetBlockIdx() % top_k;
         const int32_t expert_id = expertIdsGm.GetValue(row_idx);
-        // Task allocation: Parallelize over Groups, but limited to TopK blocks
+        
+        // Task allocation: Parallelize over Groups (K dimension)
         const int32_t g_idx = GetBlockIdx() / top_k;
         const int32_t g_count = GetBlockNum() / top_k + ((row_idx < GetBlockNum() % top_k) ? 1 : 0);
         
-        // Output Accumulator (Global to this core's task)
-        outQueueY.AllocTensor<T>(y_local); 
-        auto global_acc = y_local.template ReinterpretCast<float>();
-        Duplicate(global_acc, 0.0f, out_dim);
+        constexpr int32_t TILE_N = 2048;
 
-        for (int32_t g = g_idx; g < num_groups; g += g_count) {
-            CopyIn(expert_id, row_idx, g);
-            Compute(g, expert_id, global_acc); 
+        // --- Outer Loop: Tile N dimension ---
+        // 这样可以保证 Buffer 不需要完整的 out_dim 大小
+        for (int32_t n_start = 0; n_start < out_dim; n_start += TILE_N) {
+            int32_t cur_n_len = (out_dim - n_start < TILE_N) ? (out_dim - n_start) : TILE_N;
+            
+            // Output Accumulator (Global to this core's task for current N-Tile)
+            outQueueY.AllocTensor<T>(y_local); 
+            auto global_acc = y_local.template ReinterpretCast<float>();
+            Duplicate(global_acc, 0.0f, cur_n_len); // Init Accumulator for this tile
+
+            // --- Inner Loop: Iterate all K-Groups assigned to this core ---
+            for (int32_t g = g_idx; g < num_groups; g += g_count) {
+                ProcessGroup(g, expert_id, row_idx, n_start, cur_n_len, global_acc); 
+            }
+
+            // Copy out the result for this N-Tile
+            outQueueY.EnQue(y_local);
+            CopyOut(row_idx, n_start, cur_n_len);
         }
-
-        outQueueY.EnQue(y_local);
-        CopyOut(row_idx);
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t expert_id, int32_t row_idx, int32_t group_idx)
+    __aicore__ inline void CopyInX(int32_t expert_id, int32_t row_idx, int32_t group_idx)
     {
-        // 1. Load Scale & Offset (Zeros)
-        // [Experts, Groups, OutDim]
-        uint64_t sz_offset = (uint64_t)expert_id * this->num_groups * this->out_dim +
-                            (uint64_t)group_idx * this->out_dim;
-        
-        inQueueScale.AllocTensor<T>(s_local);
-        inQueueOffset.AllocTensor<T>(z_local);
-        
-        DataCopy(s_local, scalesGm[sz_offset], out_dim);
-        DataCopy(z_local, zerosGm[sz_offset], out_dim);
-        
-        inQueueScale.EnQue(s_local);
-        inQueueOffset.EnQue(z_local);
-
-        // 2. Load X (One Group)
+        // X Loading is independent of N-Tiling
         uint64_t x_offset;
         if constexpr (IS_BROADCAST_X) {
             x_offset = group_idx * GROUP_SIZE;
@@ -224,70 +228,90 @@ private:
         inQueueX.EnQue(x_local);
     }
 
-    // Helper to load a chunk of W
-    __aicore__ inline void CopyInW(int32_t expert_id, int32_t group_idx, int32_t k_inner_start)
+    __aicore__ inline void CopyInSZ(int32_t expert_id, int32_t row_idx, int32_t group_idx, int32_t n_offset, int32_t cur_n_len)
     {
-        uint64_t w_stride_k = this->out_dim_packed;
+        // 1. Load Scale & Offset (Zeros) for current N-Tile
+        // [Experts, Groups, OutDim] -> Offset by n_offset
+        uint64_t sz_offset = (uint64_t)expert_id * this->num_groups * this->out_dim +
+                            (uint64_t)group_idx * this->out_dim + 
+                            n_offset;
+        
+        inQueueScale.AllocTensor<T>(s_local);
+        inQueueOffset.AllocTensor<T>(z_local);
+        
+        DataCopy(s_local, scalesGm[sz_offset], cur_n_len);
+        DataCopy(z_local, zerosGm[sz_offset], cur_n_len);
+        
+        inQueueScale.EnQue(s_local);
+        inQueueOffset.EnQue(z_local);
+    }
+
+    // Helper to load a chunk of W (Tiled by N)
+    __aicore__ inline void CopyInW(int32_t expert_id, int32_t group_idx, int32_t k_inner_start, int32_t n_offset, int32_t cur_n_len)
+    {
+        uint64_t w_stride_k = this->out_dim_packed; // Global stride is still full N/8
+        int32_t cur_n_packed = cur_n_len / PACK_RATIO;
+        int32_t n_offset_packed = n_offset / PACK_RATIO;
+
         // W layout: [Expert, InDim, OutDim/8]
-        // k_idx = group_idx * 128 + k_inner_start
+        // Base Offset points to the start of the row + current N-tile offset
         uint64_t w_offset = (uint64_t)expert_id * this->in_dim * w_stride_k + 
-                            (uint64_t)(group_idx * GROUP_SIZE + k_inner_start) * w_stride_k;
+                            (uint64_t)(group_idx * GROUP_SIZE + k_inner_start) * w_stride_k +
+                            n_offset_packed;
         
         inQueueW.AllocTensor<int32_t>(w_local);
-        // Copy COMPUTE_ROWS * OutDimPacked
+        
+        // Use DataCopy with Stride to pick the sub-matrix
+        // blockLen: width of current tile in bytes
+        // srcStride: width of remaining part of global matrix row in bytes
         AscendC::DataCopyExtParams w_copy_params{
             (uint16_t)COMPUTE_ROWS, 
-            (uint32_t)(out_dim_packed * sizeof(int32_t)), 
-            (uint32_t)((w_stride_k - out_dim_packed) * sizeof(int32_t)), 
+            (uint32_t)(cur_n_packed * sizeof(int32_t)), 
+            (uint32_t)((w_stride_k - cur_n_packed) * sizeof(int32_t)), 
             0, 0
         };
         AscendC::DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
+        
         DataCopyPad(w_local, weightGm[w_offset], w_copy_params, padParams);
         inQueueW.EnQue(w_local);
     }
 
-    __aicore__ inline void Compute(int32_t g_idx, int32_t expert_id, LocalTensor<float>& global_acc)
+    __aicore__ inline void ProcessGroup(int32_t g_idx, int32_t expert_id, int32_t row_idx, 
+                                      int32_t n_offset, int32_t cur_n_len, 
+                                      LocalTensor<float>& global_acc)
     {
-        // Buffers
-        LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(out_dim, offset_group_acc);
-        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * out_dim, offset_w_half);
+        // Buffers (Allocated size is TILE_N, use cur_n_len for calculation)
+        LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(cur_n_len, offset_group_acc);
+        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * cur_n_len, offset_w_half);
         LocalTensor<float> x_float_full = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
         LocalTensor<half> x_half_full = calcBuf.GetWithOffset<half>(GROUP_SIZE, offset_x_half);
         
-        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(out_dim, offset_s_float);
-        LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(out_dim, offset_z_float);
+        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(cur_n_len, offset_s_float);
+        LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(cur_n_len, offset_z_float);
         LocalTensor<float> reduce_buf = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_reduce_buf);
 
-        // 1. Process X (T -> Float -> Half)
+        CopyInX(expert_id, row_idx, g_idx);
+
+        // Matrix Multiplication Loop
+        Duplicate(group_acc, 0.0f, cur_n_len);
+
+        // Process X (T -> Float -> Half)
         inQueueX.DeQue<T>(x_local);
         Cast(x_float_full, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
         Cast(x_half_full, x_float_full, RoundMode::CAST_ROUND, GROUP_SIZE);
-
-        // 2. Calculate Sum(X) for asymmetric quantization correction
-        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
-        float group_x_sum = reduce_buf.GetValue(0);
-
         inQueueX.FreeTensor(x_local);
-
-        // 3. Process Scale & Offset
-        inQueueScale.DeQue<T>(s_local);
-        inQueueOffset.DeQue<T>(z_local);
-        Cast(s_float, s_local, RoundMode::CAST_NONE, out_dim);
-        Cast(z_float, z_local, RoundMode::CAST_NONE, out_dim);
-        inQueueScale.FreeTensor(s_local);
-        inQueueOffset.FreeTensor(z_local);
-
-        // 4. Matrix Multiplication Loop (Tiled by COMPUTE_ROWS to save UB)
-        Duplicate(group_acc, 0.0f, out_dim);
         
+        int32_t cur_n_packed = cur_n_len / PACK_RATIO;
+
         for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += COMPUTE_ROWS) {
-            CopyInW(expert_id, g_idx, k_inner);
+            CopyInW(expert_id, g_idx, k_inner, n_offset, cur_n_len);
             inQueueW.DeQue<int32_t>(w_local);
 
             for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
                 // W: int32 -> int4 -> half
-                LocalTensor<int4b_t> w_int4 = w_local[i * out_dim_packed].ReinterpretCast<int4b_t>();
-                Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * out_dim);
+                // Stride logic inside w_local depends on packed width of the TILE
+                LocalTensor<int4b_t> w_int4 = w_local[i * cur_n_packed].ReinterpretCast<int4b_t>();
+                Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * cur_n_len);
 
                 half x_val_buf[GROUP_TILE];
                 for (int j = 0; j < GROUP_TILE; j++) {
@@ -295,43 +319,57 @@ private:
                 }
 
                 for (int j = 0; j < GROUP_TILE; ++j) {
-                    Axpy(group_acc, w_half[j * out_dim], x_val_buf[j], out_dim);
+                    Axpy(group_acc, w_half[j * cur_n_len], x_val_buf[j], cur_n_len);
                 }
             }
             inQueueW.FreeTensor(w_local);
         }
 
-        // 5. Finalize: Y = (X*W) * S + Sum(X) * Z * S
-        // Calc Correction: Z * S
-        Mul(z_float, z_float, s_float, out_dim);
-        // Add Correction: Acc += Sum(X) * (Z*S)
-        Axpy(global_acc, z_float, group_x_sum, out_dim);
-        // Add Main Term: Acc += (X*W) * S
-        MulAddDst(global_acc, group_acc, s_float, out_dim);
+        CopyInSZ(expert_id, row_idx, g_idx, n_offset, cur_n_len);
+        
+        // Calculate Sum(X)
+        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
+        float group_x_sum = reduce_buf.GetValue(0);
+
+        // Process Scale & Offset
+        inQueueScale.DeQue<T>(s_local);
+        inQueueOffset.DeQue<T>(z_local);
+        Cast(s_float, s_local, RoundMode::CAST_NONE, cur_n_len);
+        Cast(z_float, z_local, RoundMode::CAST_NONE, cur_n_len);
+        inQueueScale.FreeTensor(s_local);
+        inQueueOffset.FreeTensor(z_local);
+
+        // Finalize Correction
+        Mul(z_float, z_float, s_float, cur_n_len);
+        Axpy(global_acc, z_float, group_x_sum, cur_n_len);
+        MulAddDst(global_acc, group_acc, s_float, cur_n_len);
     }
 
-    __aicore__ inline void CopyOut(int32_t row_idx)
+    __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_offset, int32_t cur_n_len)
     {
         outQueueY.DeQue<T>(y_local);
         LocalTensor<float> y_fp32 = y_local.template ReinterpretCast<float>();
 
         if constexpr (IS_WEIGHTED_SUM) {
             float w_val = topkWeightsGm.GetValue(row_idx);
-            Muls(y_fp32, y_fp32, w_val, out_dim);
+            Muls(y_fp32, y_fp32, w_val, cur_n_len);
         }
 
         // Cast FP32 -> T
-        Cast(y_local, y_fp32, RoundMode::CAST_ROUND, out_dim);
+        Cast(y_local, y_fp32, RoundMode::CAST_ROUND, cur_n_len);
 
         PipeBarrier<PIPE_V>();
 
         // Atomic Add result to global memory
         AscendC::SetAtomicAdd<T>();
         if constexpr (IS_WEIGHTED_SUM) {
-            DataCopy(yGm[0], y_local, out_dim);
+            // Weighted sum output is [OutDim] (accumulated over TopK rows usually, assuming yGm is setup for that)
+            // Offset by n_offset
+            DataCopy(yGm[n_offset], y_local, cur_n_len);
         } else {
-            uint64_t y_offset = (uint64_t)row_idx * this->out_dim;
-            DataCopy(yGm[y_offset], y_local, out_dim);
+            // Standard output is [TopK, OutDim]
+            uint64_t y_offset = (uint64_t)row_idx * this->out_dim + n_offset;
+            DataCopy(yGm[y_offset], y_local, cur_n_len);
         }
         AscendC::SetAtomicNone();
 
