@@ -1,146 +1,116 @@
 import torch
 import triton
 import triton.language as tl
-
 from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
 @triton.jit
-def _repack_int4_npu_kernel(
-    src_ptr,             # Input Pointer
-    dst_ptr,             # Output Pointer
-    stride_src_row,      # N (Input Last Dim)
-    stride_dst_row,      # N // 8 (Output Last Dim)
-    total_rows,          # Total Output Rows (Input_Rows * 8)
-    num_cols_packed,     # N // 8
-    num_cores,           # NPU Cores
-    BLOCK_N: tl.constexpr, 
+def _awq_shuffle_kernel(
+    x_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CORES: tl.constexpr,
 ):
-    # --- 1. 任务划分 (Persistent Kernel) ---
-    # 计算每个 Core 负责的输出行数
-    block_size_rows = (total_rows + num_cores - 1) // num_cores
+    """
+    AWQ Weight Shuffle Kernel for NPU
+    Performs the bit manipulation logic:
+    shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+    result = ((val >> shift) & 0xF) << (i * 4)
+    result = result ^ 0x88888888
+    """
     pid = tl.program_id(0)
-    
-    row_begin = pid * block_size_rows
-    row_end = tl.minimum((pid + 1) * block_size_rows, total_rows)
 
-    if row_begin >= total_rows:
+    # 1. NPU Grid Strategy: 每个核心计算一部分数据
+    # 计算当前核心需要处理的起始位置和结束位置
+    # 类似 block_size = (total_rows - 1) // NUM_CORES + 1
+    elements_per_core = (n_elements + NUM_CORES - 1) // NUM_CORES
+    start_idx = pid * elements_per_core
+    
+    # 越界检查（针对最后一个核心可能处理不满的情况）
+    if start_idx >= n_elements:
         return
-
-    # --- 2. 行循环 ---
-    for row_idx in range(row_begin, row_end):
         
-        # 映射逻辑:
-        # Output Row 'r' 数据来源于 Input Row 'r // 8'
-        # 内核把所有维度扁平化视为 [Total_Rows, N]
-        src_row_idx = row_idx // 8
+    end_idx = tl.minimum(start_idx + elements_per_core, n_elements)
+
+    # 2. 循环处理当前核心分配到的数据块
+    for i in range(start_idx, end_idx, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < end_idx # 注意这里是 end_idx，因为是分片处理
         
-        # 计算移位量: Input int32 包含 8 个解包前的值
-        # 我们需要第 (row_idx % 8) 个 4-bit 数据
-        k_shift = (row_idx % 8) * 4
+        # 加载数据
+        val = tl.load(x_ptr + offsets, mask=mask, other=0)
+        
+        # 3. Bitwise Shuffle Logic (Unrolled for performance)
+        # 原始逻辑: shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        # output_nibble[i] = input_nibble[shifts[i]]
+        
+        # 临时变量累加结果
+        res = tl.zeros_like(val)
 
-        # --- 3. 列块循环 ---
-        for col_idx in range(0, num_cols_packed, BLOCK_N):
-            
-            # 生成列偏移 [BLOCK_N]
-            cols_offs = col_idx + tl.arange(0, BLOCK_N)
-            mask_n = cols_offs < num_cols_packed
-            
-            # 生成 2D 读取偏移 [BLOCK_N, 8]
-            # row dim (BLOCK_N): 对应输出的连续列
-            # col dim (8): 对应打包所需的连续输入值 (N维度)
-            offs_2d_n = cols_offs[:, None] * 8 + tl.arange(0, 8)[None, :]
-            
-            # 扁平化寻址
-            src_ptr_base = src_ptr + src_row_idx * stride_src_row
-            
-            # Load Data [BLOCK_N, 8]
-            val_block = tl.load(src_ptr_base + offs_2d_n, mask=mask_n[:, None], other=0)
+        # i=0: src shift 0 (0*4) -> dst shift 0 (0*4)
+        res |= (val >> 0) & 0x0000000F
+        
+        # i=1: src shift 16 (4*4) -> dst shift 4 (1*4)
+        # 注意: 右移后必须 & 0xF 清除高位（特别是处理负数符号位扩展时）
+        res |= ((val >> 16) & 0x0000000F) << 4
+        
+        # i=2: src shift 4 (1*4) -> dst shift 8 (2*4)
+        res |= ((val >> 4) & 0x0000000F) << 8
+        
+        # i=3: src shift 20 (5*4) -> dst shift 12 (3*4)
+        res |= ((val >> 20) & 0x0000000F) << 12
+        
+        # i=4: src shift 8 (2*4) -> dst shift 16 (4*4)
+        res |= ((val >> 8) & 0x0000000F) << 16
+        
+        # i=5: src shift 24 (6*4) -> dst shift 20 (5*4)
+        res |= ((val >> 24) & 0x0000000F) << 20
+        
+        # i=6: src shift 12 (3*4) -> dst shift 24 (6*4)
+        res |= ((val >> 12) & 0x0000000F) << 24
+        
+        # i=7: src shift 28 (7*4) -> dst shift 28 (7*4)
+        # PyTorch int32是有符号的，右移28位如果是负数会带符号位，
+        # 所以必须 & 0xF 确保只取最低4位
+        res |= ((val >> 28) & 0x0000000F) << 28
 
-            # --- 4. 计算与打包 (No Slicing Approach) ---
-            
-            # Step A: 解包 (Shift)
-            nibbles = (val_block >> k_shift) & 0xF
-            
-            # Step B: 变换 (x ^ 0x8) 等价于 ((x & 0xF) - 8)
-            nibbles = nibbles ^ 0x8
-            
-            # Step C: 打包 (Broadcast Shift + Reduce Sum)
-            # 1. 构造移位向量 [0, 4, ..., 28]
-            shift_vals = tl.arange(0, 8) * 4
-            
-            # 2. 广播移位: [BLOCK_N, 8]
-            nibbles_shifted = nibbles << shift_vals[None, :]
-            
-            # 3. 规约求和 (axis=1) -> [BLOCK_N]
-            packed_acc = tl.sum(nibbles_shifted, axis=1)
+        # 4. XOR 操作 (用于处理Zero Point翻转等)
+        res = res ^ 0x88888888
+        
+        # 5. 原地写回
+        tl.store(x_ptr + offsets, res, mask=mask)
 
-            # --- 5. 存储 ---
-            dst_offset = row_idx * stride_dst_row + cols_offs
-            tl.store(dst_ptr + dst_offset, packed_acc, mask=mask_n)
-
-
-def repack_int4_tensor_npu(packed_weight: torch.Tensor):
+def repack_qweight_inplace_npu(weight_tensor: torch.Tensor):
     """
-    Triton NPU 实现：重排权重以适配 Ascend int4pack 格式。
-    支持 2D [K, N] 或 3D [E, K, N] 输入。
-    
-    逻辑:
-    1. 输入 K 维度 (倒数第2维) 实际上包含了 8 个压缩的 int4 值。
-    2. 需要将其解包，行数 x8。
-    3. 输入 N 维度 (倒数第1维) 需要按 int4pack 格式每 8 个压缩为一个 int32。
-    4. 列数 /8。
+    对 AWQ int32 权重进行原地 Shuffle。
+    适用于 Huawei NPU。
     """
-    # 1. 基础校验
-    assert packed_weight.ndim in [2, 3], f"Expected 2D or 3D tensor, got {packed_weight.ndim}"
-    if not packed_weight.is_contiguous():
-        packed_weight = packed_weight.contiguous()
+    # 确保张量在 NPU 上且连续
+    if not weight_tensor.is_npu:
+        raise ValueError("Tensor must be on NPU")
+    
+    # 展平处理，视作一维 int32 数组
+    flat_tensor = weight_tensor.view(-1)
+    if not flat_tensor.is_contiguous():
+        flat_tensor = flat_tensor.contiguous()
         
-    shape = packed_weight.shape
-    N = shape[-1] # 最后一维是需要打包的维度
+    n_elements = flat_tensor.numel()
     
-    assert N % 8 == 0, f"Last dimension {N} must be divisible by 8 for packing"
-
-    # 2. 维度计算
-    # 无论 2D 还是 3D，除最后一维 N 外的所有维度乘积即为 "Input Logical Rows"
-    input_logical_rows = 1
-    for d in shape[:-1]:
-        input_logical_rows *= d
+    # 获取 NPU 硬件属性 (Vector Cores 数量)
+    # 通常 Ascend 910B 为 30 左右，具体取决于型号
+    _, num_vectorcore = get_device_properties()
     
-    # 3. 构建输出形状
-    # Output Rows = Input Rows * 8 (因为解包了 K 维度)
-    total_output_rows = input_logical_rows * 8
-    N_packed = N // 8
-    
-    # 保持输出 Tensor 的秩与输入一致
-    out_shape = list(shape)
-    out_shape[-2] *= 8     # K 维度扩大 8 倍
-    out_shape[-1] = N_packed # N 维度缩小 8 倍
-    
-    new_weight = torch.empty(out_shape, dtype=torch.int32, device=packed_weight.device)
-    
-    # 4. 获取硬件参数
-    num_vectorcore = 30 # Default for 910B
-    if get_device_properties is not None:
-        try:
-            _, num_vectorcore = get_device_properties()
-        except:
-            pass
-
-    # Grid size = 核心数 (Persistent Kernel)
+    # Grid 固定为 Vector Core 数量
     grid = (num_vectorcore, )
     
-    # 5. 启动 Kernel
-    # stride_src_row 始终是 N (最后一维的大小，因为是 row-major)
-    # stride_dst_row 始终是 N_packed
-    _repack_int4_npu_kernel[grid](
-        packed_weight, 
-        new_weight,
-        stride_src_row=N,
-        stride_dst_row=N_packed,
-        total_rows=total_output_rows,
-        num_cols_packed=N_packed,
-        num_cores=num_vectorcore,
-        BLOCK_N=128
+    # BLOCK_SIZE 设为 1024 或 512 以充分利用向量单元
+    # 256/512/1024 都是 NPU 友好的对齐大小
+    BLOCK_SIZE = 1024 
+
+    _awq_shuffle_kernel[grid](
+        flat_tensor,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        NUM_CORES=num_vectorcore,
     )
     
-    return new_weight
+    return weight_tensor

@@ -138,7 +138,7 @@ def run_stable_test():
     TOP_K = 8
     NUM_EXPERTS = 128
     IN_DIM = 2048 # 必须是 128 的倍数
-    OUT_DIM = 1536
+    OUT_DIM = 4096 
     GROUP_SIZE = 128
     
     device_str = "npu:0"
