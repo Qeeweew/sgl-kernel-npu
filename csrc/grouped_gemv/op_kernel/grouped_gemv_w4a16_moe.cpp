@@ -1,3 +1,4 @@
+#define K_MAX_SHAPE_DIM 0
 #include "kernel_operator.h"
 #include "zero_out_impl.h"
 #include <type_traits>
@@ -247,7 +248,7 @@ private:
     }
 
     // Helper to load a chunk of W (Tiled by N)
-    __aicore__ inline void CopyInW(int32_t expert_id, int32_t group_idx, int32_t k_inner_start, int32_t n_offset, int32_t cur_n_len)
+    __aicore__ inline void CopyInW(int32_t expert_id, int32_t group_idx, int32_t k_inner_start, int32_t n_offset, int32_t cur_n_len, LocalTensor<int32_t>& w_local)
     {
         uint64_t w_stride_k = this->out_dim_packed; // Global stride is still full N/8
         int32_t cur_n_packed = cur_n_len / PACK_RATIO;
@@ -276,6 +277,45 @@ private:
         inQueueW.EnQue(w_local);
     }
 
+    __aicore__ inline void ComputeChunk(
+        LocalTensor<int32_t>& w_local,
+        int32_t x_offset_idx,
+        int32_t tile_n,
+        int32_t tile_n_packed,
+        LocalTensor<half>& x_full_half,
+        LocalTensor<float>& group_acc_xw)
+    {
+        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(
+            GROUP_TILE * tile_n, offset_w_half);
+
+        LocalTensor<uint64_t> x_u64 = x_full_half.ReinterpretCast<uint64_t>();
+        constexpr int STEP = 4;
+
+        for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
+            LocalTensor<int4b_t> w_int4 =
+                w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
+
+            half x_val_buf[GROUP_TILE];
+            uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
+
+            for (int k = 0; k < GROUP_TILE; k += STEP) {
+                x_val_buf_u64[k / STEP] =
+                    x_u64.GetValue((x_offset_idx + i + k) / STEP);
+            }
+
+            Cast(w_half, w_int4, RoundMode::CAST_NONE,
+                GROUP_TILE * tile_n);
+
+            for (int k = 0; k < GROUP_TILE; ++k) {
+                Axpy(group_acc_xw,
+                    w_half[k * tile_n],
+                    x_val_buf[k],
+                    tile_n);
+            }
+        }
+    }
+
+
     __aicore__ inline void ProcessGroup(int32_t g_idx, int32_t expert_id, int32_t row_idx, 
                                       int32_t n_offset, int32_t cur_n_len, 
                                       LocalTensor<float>& global_acc)
@@ -292,43 +332,49 @@ private:
 
         CopyInX(expert_id, row_idx, g_idx);
 
+        CopyInW(expert_id, g_idx, 0, n_offset, cur_n_len, w_local_arr[0]);
+
         // Matrix Multiplication Loop
         Duplicate(group_acc, 0.0f, cur_n_len);
 
         // Process X (T -> Float -> Half)
-        inQueueX.DeQue<T>(x_local);
+        inQueueX.DeQue(x_local);
+
+
         Cast(x_float_full, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
         Cast(x_half_full, x_float_full, RoundMode::CAST_ROUND, GROUP_SIZE);
         inQueueX.FreeTensor(x_local);
+        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
         
         int32_t cur_n_packed = cur_n_len / PACK_RATIO;
 
+        int w_idx = 0;
         for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += COMPUTE_ROWS) {
-            CopyInW(expert_id, g_idx, k_inner, n_offset, cur_n_len);
-            inQueueW.DeQue<int32_t>(w_local);
-
-            for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
-                // W: int32 -> int4 -> half
-                // Stride logic inside w_local depends on packed width of the TILE
-                LocalTensor<int4b_t> w_int4 = w_local[i * cur_n_packed].ReinterpretCast<int4b_t>();
-                Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * cur_n_len);
-
-                half x_val_buf[GROUP_TILE];
-                for (int j = 0; j < GROUP_TILE; j++) {
-                    x_val_buf[j] = x_half_full.GetValue(k_inner + i + j);
-                }
-
-                for (int j = 0; j < GROUP_TILE; ++j) {
-                    Axpy(group_acc, w_half[j * cur_n_len], x_val_buf[j], cur_n_len);
-                }
+            // 1. 预取下一块
+            if (k_inner + COMPUTE_ROWS < GROUP_SIZE) {
+                CopyInW(expert_id, g_idx, k_inner + COMPUTE_ROWS, n_offset, cur_n_len, w_local_arr[w_idx ^ 1]);
+            } else {
+                CopyInSZ(expert_id, row_idx, g_idx, n_offset, cur_n_len);
             }
-            inQueueW.FreeTensor(w_local);
-        }
 
-        CopyInSZ(expert_id, row_idx, g_idx, n_offset, cur_n_len);
+            // 2. DeQue 当前 W
+            inQueueW.DeQue(w_local_arr[w_idx]);
+
+            // 3. 计算（封装）
+            ComputeChunk(
+                w_local_arr[w_idx],
+                k_inner,
+                cur_n_len,
+                cur_n_packed,
+                x_half_full,
+                group_acc);
+
+            // 4. 释放
+            inQueueW.FreeTensor(w_local_arr[w_idx]);
+            w_idx ^= 1;
+        }
         
         // Calculate Sum(X)
-        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
         float group_x_sum = reduce_buf.GetValue(0);
 
         // Process Scale & Offset
@@ -395,7 +441,7 @@ private:
     AscendC::GlobalTensor<T> yGm;
 
     LocalTensor<T> x_local, s_local, z_local, y_local;
-    LocalTensor<int32_t> w_local;
+    LocalTensor<int32_t> w_local_arr[2];
 
     int32_t top_k;
     int32_t in_dim;

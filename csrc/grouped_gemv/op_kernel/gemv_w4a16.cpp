@@ -1,3 +1,4 @@
+#define K_MAX_SHAPE_DIM 0
 #include "kernel_operator.h"
 #include "zero_out_impl.h"
 
@@ -150,63 +151,108 @@ public:
     }
 
 private:
-    __aicore__ inline void ProcessGroup(int32_t g_idx, int32_t n_offset, int32_t tile_n, int32_t tile_n_packed)
+    __aicore__ inline void ProcessGroup(
+        int32_t g_idx,
+        int32_t n_offset,
+        int32_t tile_n,
+        int32_t tile_n_packed)
     {
-        // 1. Load Full X for Group
+        // ------------------------------------------------------------
+        // 1. Load X (full quant group)
+        // ------------------------------------------------------------
         inQueueX.AllocTensor<T>(x_local);
         DataCopy(x_local, xGm[g_idx * QUANT_GROUP_SIZE], QUANT_GROUP_SIZE);
         inQueueX.EnQue(x_local);
 
-        inQueueX.DeQue<T>(x_local);
-        
-        // 2. Pre-process X: Cast to Float and Half
-        LocalTensor<float> x_full_float = calcBuf.GetWithOffset<float>(QUANT_GROUP_SIZE, offset_x_full_float);
-        LocalTensor<half> x_full_half = calcBuf.GetWithOffset<half>(QUANT_GROUP_SIZE, offset_x_full_half);
+        // ------------------------------------------------------------
+        // 2. Prefetch first W block
+        // ------------------------------------------------------------
+        int32_t k_group_start = g_idx * QUANT_GROUP_SIZE;
+
+        CopyInW(k_group_start, n_offset, tile_n, tile_n_packed, w_local_arr[0]);
+
+        inQueueX.DeQue(x_local);
+
+        LocalTensor<float> x_full_float =
+            calcBuf.GetWithOffset<float>(QUANT_GROUP_SIZE, offset_x_full_float);
+        LocalTensor<half> x_full_half =
+            calcBuf.GetWithOffset<half>(QUANT_GROUP_SIZE, offset_x_full_half);
 
         Cast(x_full_float, x_local, RoundMode::CAST_NONE, QUANT_GROUP_SIZE);
         Cast(x_full_half, x_full_float, RoundMode::CAST_ROUND, QUANT_GROUP_SIZE);
         inQueueX.FreeTensor(x_local);
 
-        // 3. Compute W * X Loop
-        LocalTensor<float> group_acc_xw = calcBuf.GetWithOffset<float>(tile_n, offset_group_acc);
+        // ------------------------------------------------------------
+        // 3. Init group accumulator
+        // ------------------------------------------------------------
+        LocalTensor<float> group_acc_xw =
+            calcBuf.GetWithOffset<float>(tile_n, offset_group_acc);
         Duplicate(group_acc_xw, 0.0f, tile_n);
 
-        int32_t k_group_start = g_idx * QUANT_GROUP_SIZE;
-        
-        // W 依然分块加载，以节省 UB
-        for (int32_t k_inner = 0; k_inner < QUANT_GROUP_SIZE; k_inner += COMPUTE_ROWS) {
-            CopyInW(k_group_start + k_inner, n_offset, tile_n, tile_n_packed);
-            ComputeChunk(k_inner, tile_n, tile_n_packed, x_full_half, group_acc_xw);
+
+        int w_idx = 0;
+
+        // ------------------------------------------------------------
+        // 4. K-loop with pipeline
+        // ------------------------------------------------------------
+        for (int32_t k_inner = 0; k_inner < QUANT_GROUP_SIZE; k_inner += COMPUTE_ROWS)
+        {
+            // ---- Prefetch next data ----
+            if (k_inner + COMPUTE_ROWS < QUANT_GROUP_SIZE) {
+                CopyInW(k_group_start + k_inner + COMPUTE_ROWS, n_offset, tile_n, tile_n_packed, w_local_arr[w_idx ^ 1]);
+            } else {
+                // Last K block: prefetch Scale & Zero
+                CopyInScaleZero(g_idx, n_offset, tile_n);
+            }
+
+            // ---- Compute current block ----
+            inQueueW.DeQue(w_local_arr[w_idx]);
+
+            ComputeChunk(
+                w_local_arr[w_idx],
+                k_inner,
+                tile_n,
+                tile_n_packed,
+                x_full_half,
+                group_acc_xw);
+
+            inQueueW.FreeTensor(w_local_arr[w_idx]);
+            w_idx ^= 1;
         }
 
-
-        CopyInScaleZero(g_idx, n_offset, tile_n);
-
-        // 4. Calculate Sum(X)
-        LocalTensor<float> reduce_buf = calcBuf.GetWithOffset<float>(QUANT_GROUP_SIZE, offset_reduce_buf);
+        // ------------------------------------------------------------
+        // 5. ReduceSum(X)
+        // ------------------------------------------------------------
+        LocalTensor<float> reduce_buf =
+            calcBuf.GetWithOffset<float>(QUANT_GROUP_SIZE, offset_reduce_buf);
         ReduceSum(reduce_buf, x_full_float, reduce_buf, QUANT_GROUP_SIZE);
         float group_sum_x = reduce_buf.GetValue(0);
 
+        // ------------------------------------------------------------
+        // 6. Apply Scale & Zero
+        // ------------------------------------------------------------
+        LocalTensor<float> s_float =
+            calcBuf.GetWithOffset<float>(tile_n, offset_s_float);
+        LocalTensor<float> z_float =
+            calcBuf.GetWithOffset<float>(tile_n, offset_z_float);
 
-        // 5. Load Scale & Offset
-        
-        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(tile_n, offset_s_float);
-        LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(tile_n, offset_z_float);
-        
         inQueueScale.DeQue<T>(s_local);
         inQueueOffset.DeQue<T>(z_local);
+
         Cast(s_float, s_local, RoundMode::CAST_NONE, tile_n);
         Cast(z_float, z_local, RoundMode::CAST_NONE, tile_n);
+
         inQueueScale.FreeTensor(s_local);
         inQueueOffset.FreeTensor(z_local);
 
-        // 6. Accumulate to Global Y (Scale + Offset)
-        // Y += Sum(X) * Offset * Scale
+        // Y += Sum(X) * Z * S
         Mul(z_float, z_float, s_float, tile_n);
         Axpy(y_acc_global, z_float, group_sum_x, tile_n);
-        // Y += (X * W) * Scale
+
+        // Y += (X * W) * S
         MulAddDst(y_acc_global, group_acc_xw, s_float, tile_n);
     }
+
 
     __aicore__ inline void CopyInScaleZero(int32_t g_idx, int32_t n_offset, int32_t tile_n)
     {
@@ -219,46 +265,67 @@ private:
         inQueueOffset.EnQue(z_local);
     }
 
-    __aicore__ inline void CopyInW(int32_t k_global, int32_t n_offset, int32_t tile_n, int32_t tile_n_packed)
+    __aicore__ inline void CopyInW(
+        int32_t k_global,
+        int32_t n_offset,
+        int32_t tile_n,
+        int32_t tile_n_packed,
+        LocalTensor<int32_t>& w_local)
     {
         uint64_t w_stride = this->out_dim_packed;
-        uint64_t w_offset = (uint64_t)k_global * w_stride + (n_offset / PACK_RATIO);
-        
+        uint64_t w_offset =
+            (uint64_t)k_global * w_stride + (n_offset / PACK_RATIO);
+
         inQueueW.AllocTensor<int32_t>(w_local);
-        
-        AscendC::DataCopyExtParams w_copy_params{
-            (uint16_t)COMPUTE_ROWS, 
-            (uint32_t)(tile_n_packed * sizeof(int32_t)), 
-            (uint32_t)((w_stride - tile_n_packed) * sizeof(int32_t)), 
+
+        AscendC::DataCopyExtParams params{
+            (uint16_t)COMPUTE_ROWS,
+            (uint32_t)(tile_n_packed * sizeof(int32_t)),
+            (uint32_t)((w_stride - tile_n_packed) * sizeof(int32_t)),
             0, 0
         };
         AscendC::DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
-        DataCopyPad(w_local, weightGm[w_offset], w_copy_params, padParams);
+
+        DataCopyPad(w_local, weightGm[w_offset], params, padParams);
         inQueueW.EnQue(w_local);
     }
 
-    __aicore__ inline void ComputeChunk(int32_t x_offset_idx, int32_t tile_n, int32_t tile_n_packed, 
-                                        LocalTensor<half>& x_full_half, LocalTensor<float>& group_acc_xw)
+    __aicore__ inline void ComputeChunk(
+        LocalTensor<int32_t>& w_local,
+        int32_t x_offset_idx,
+        int32_t tile_n,
+        int32_t tile_n_packed,
+        LocalTensor<half>& x_full_half,
+        LocalTensor<float>& group_acc_xw)
     {
-        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * tile_n, offset_w_half);
-        inQueueW.DeQue<int32_t>(w_local);
+        LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(
+            GROUP_TILE * tile_n, offset_w_half);
+
+        LocalTensor<uint64_t> x_u64 = x_full_half.ReinterpretCast<uint64_t>();
+        constexpr int STEP = 4;
 
         for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
-            // 反量化 8 行 W
-            LocalTensor<int4b_t> w_int4 = w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
-            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * tile_n);
+            LocalTensor<int4b_t> w_int4 =
+                w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
 
             half x_val_buf[GROUP_TILE];
-            for (int k = 0; k < GROUP_TILE; k++) {
-                // 从驻留在 UB 的完整 X Tensor 中取值
-                x_val_buf[k] = x_full_half.GetValue(x_offset_idx + i + k);
+            uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
+
+            for (int k = 0; k < GROUP_TILE; k += STEP) {
+                x_val_buf_u64[k / STEP] =
+                    x_u64.GetValue((x_offset_idx + i + k) / STEP);
             }
 
+            Cast(w_half, w_int4, RoundMode::CAST_NONE,
+                GROUP_TILE * tile_n);
+
             for (int k = 0; k < GROUP_TILE; ++k) {
-                Axpy(group_acc_xw, w_half[k * tile_n], x_val_buf[k], tile_n);
+                Axpy(group_acc_xw,
+                    w_half[k * tile_n],
+                    x_val_buf[k],
+                    tile_n);
             }
         }
-        inQueueW.FreeTensor(w_local);
     }
 
     __aicore__ inline void CopyOut(int32_t n_offset, int32_t tile_n)
@@ -286,7 +353,7 @@ private:
     AscendC::GlobalTensor<T> yGm;
 
     LocalTensor<T> x_local, s_local, z_local;
-    LocalTensor<int32_t> w_local;
+    LocalTensor<int32_t> w_local_arr[2];
     LocalTensor<float> y_acc_global;
 
     uint32_t offset_w_half;
