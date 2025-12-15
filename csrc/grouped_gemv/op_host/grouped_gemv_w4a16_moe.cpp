@@ -1,9 +1,10 @@
 #include "defines.h"
 #include "tiling/platform/platform_ascendc.h"
+// 包含生成的 Kernel Launch 头文件 (根据 Kernel 导出名)
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_fp16.h"
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_bf16.h"
-#include "aclrtlaunch_fused_moe_bs1_w4a16_fp16.h"
-#include "aclrtlaunch_fused_moe_bs1_w4a16_bf16.h"
+#include "aclrtlaunch_fused_moe_small_bs_w4a16_fp16.h"
+#include "aclrtlaunch_fused_moe_small_bs_w4a16_bf16.h"
 #include "torch_helper.h"
 
 namespace sglang {
@@ -11,63 +12,63 @@ namespace npu_kernel {
 
 constexpr uint32_t PADDING_BYTE = 32U;
 
+// -----------------------------------------------------------------------------
+// Standalone GEMV Host API
+// -----------------------------------------------------------------------------
 HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Tensor &weight,
                                            const at::Tensor &scales, const at::Tensor &offsets, 
                                            const at::Tensor &expert_ids)
 {
-    // ----------------------------------------------------------------
     // 1. Shape & Type Checks
-    // ----------------------------------------------------------------
     TORCH_CHECK(weight.dtype() == at::kInt, "weight must be int32 (packed int4)");
     TORCH_CHECK(expert_ids.dtype() == at::kInt, "expert_ids must be int32");
     TORCH_CHECK(x_in.dtype() == scales.dtype(), "x and scales must have the same dtype");
-    TORCH_CHECK(x_in.dtype() == offsets.dtype(), "x and offsets must have the same dtype");
     
-    // Validate Weight Shape: [NumExperts, InDim, OutDim_Packed]
-    TORCH_CHECK(weight.dim() == 3, "Weight must be 3D: [Experts, InDim, OutDim/8]");
-    
+    // Weight Shape: [NumExperts, InDim, OutDim_Packed]
     int32_t num_experts = weight.size(0);
     int32_t in_dim = weight.size(1);
-    int32_t out_dim_packed = weight.size(2);
-    int32_t out_dim = out_dim_packed * 8; 
+    int32_t out_dim = weight.size(2) * 8; 
 
-    // Validate Scales & offsets: [Experts, Groups, OutDim]
-    TORCH_CHECK(scales.dim() == 3, "Scales must be 3D");
-    TORCH_CHECK(offsets.dim() == 3, "offsets must be 3D");
-    TORCH_CHECK(scales.size(0) == num_experts && offsets.size(0) == num_experts, "Experts dim mismatch");
-    TORCH_CHECK(scales.size(2) == out_dim && offsets.size(2) == out_dim, "OutDim mismatch");
-    
-    int32_t num_groups = scales.size(1);
-    TORCH_CHECK(offsets.size(1) == num_groups, "offsets Groups dim mismatch");
-    TORCH_CHECK(num_groups > 0, "NumGroups must be > 0");
-    TORCH_CHECK(in_dim % num_groups == 0, "InDim must be divisible by NumGroups");
-    
-    // Validate Group Size (Targeting 128)
-    int32_t group_size = in_dim / num_groups;
-    TORCH_CHECK(group_size == 128, "Kernel currently optimized for group_size=128");
+    // 处理 expert_ids (支持 1D 或 2D)
+    // Kernel 需要 total_tokens 和 top_k
+    int32_t total_tokens = expert_ids.numel();
+    int32_t top_k = 0;
 
-    int32_t top_k = expert_ids.size(0);
+    at::Tensor expert_ids_flat = expert_ids.flatten().contiguous();
 
-    // ----------------------------------------------------------------
-    // 2. Preprocess Input X
-    // ----------------------------------------------------------------
-    at::Tensor x_contiguous;
-    if (x_in.dim() == 1) {
-        TORCH_CHECK(x_in.size(0) == in_dim, "X dim mismatch");
-        x_contiguous = x_in.view({1, in_dim}).expand({top_k, in_dim}).contiguous();
-    } else if (x_in.size(0) == 1) {
-        x_contiguous = x_in.expand({top_k, in_dim}).contiguous();
+    if (expert_ids.dim() == 2) {
+        // [BatchSize, TopK]
+        top_k = expert_ids.size(1);
+    } else if (expert_ids.dim() == 1) {
+        // [TopK] (BatchSize=1)
+        top_k = expert_ids.size(0);
     } else {
-        TORCH_CHECK(x_in.numel() == top_k * in_dim, "X numel mismatch");
+        TORCH_CHECK(false, "expert_ids must be 1D or 2D");
+    }
+
+    // Preprocess Input X
+    // 如果 X 是 [BS, InDim]，需要扩展为 [TotalTokens, InDim] 供 GEMV 使用
+    // 但通常 grouped_gemv 的输入 X 已经是 gather 后的 [TotalTokens, InDim] 或者需要广播
+    // 这里假设 grouped_gemv 的 X 需要与 expert_ids 对应。
+    // 为了兼容性，如果 X 是 [BS, InDim]，我们做 view/expand。
+    at::Tensor x_contiguous;
+    int32_t batch_size = total_tokens / top_k;
+    
+    if (x_in.size(0) == batch_size && x_in.size(1) == in_dim) {
+        // X: [BS, InDim] -> expand to [BS, TopK, InDim] -> flatten to [TotalTokens, InDim]
+        x_contiguous = x_in.unsqueeze(1).expand({batch_size, top_k, in_dim}).reshape({-1, in_dim}).contiguous();
+    } else {
+        TORCH_CHECK(x_in.size(0) == total_tokens, "X dim 0 must match total_tokens or batch_size");
         x_contiguous = x_in.contiguous();
     }
 
-    bool is_fp16 = (x_in.dtype() == at::kHalf);
-    at::Tensor y = at::zeros({top_k, out_dim}, x_in.options());
+    at::Tensor y = at::zeros({total_tokens, out_dim}, x_in.options());
     
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
     auto acl_stream = c10_npu::getCurrentNPUStream();
+
+    bool is_fp16 = (x_in.dtype() == at::kHalf);
 
     if (is_fp16) {
         ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_fp16)
@@ -76,9 +77,9 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
          const_cast<void *>(weight.data_ptr()),
          const_cast<void *>(scales.data_ptr()),
          const_cast<void *>(offsets.data_ptr()),
-         const_cast<void *>(expert_ids.data_ptr()),
+         const_cast<void *>(expert_ids_flat.data_ptr()),
          y.data_ptr(),
-         top_k, in_dim, out_dim, num_experts
+         total_tokens, in_dim, out_dim, num_experts, top_k
         );
     } else { 
         ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_bf16)
@@ -87,61 +88,74 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
          const_cast<void *>(weight.data_ptr()),
          const_cast<void *>(scales.data_ptr()),
          const_cast<void *>(offsets.data_ptr()),
-         const_cast<void *>(expert_ids.data_ptr()),
+         const_cast<void *>(expert_ids_flat.data_ptr()),
          y.data_ptr(),
-         top_k, in_dim, out_dim, num_experts
+         total_tokens, in_dim, out_dim, num_experts, top_k
         );
     }
 
     return y;
 }
 
-// Updated API with offsets for both layers
-// Updated API with offsets for both layers
-HOST_API at::Tensor fused_moe_w4a16_bs1(
+// -----------------------------------------------------------------------------
+// Fused MoE Host API (BS <= 4)
+// -----------------------------------------------------------------------------
+HOST_API at::Tensor fused_moe_w4a16_small_bs(
     const at::Tensor &x_in, 
     const at::Tensor &w13_weight, const at::Tensor &w13_scales, const at::Tensor &w13_offsets,
     const at::Tensor &w2_weight, const at::Tensor &w2_scales, const at::Tensor &w2_offsets,
     const at::Tensor &expert_ids, const at::Tensor &topk_weights)
 {
-    // --- 修改开始：Flatten 并在必要时使其连续 ---
-    // 使用局部变量持有 flatten 后的 tensor
-    at::Tensor expert_ids_flat = expert_ids.flatten().contiguous();
-    at::Tensor topk_weights_flat = topk_weights.flatten().contiguous();
+    // 1. 维度检查与预处理
+    // expert_ids: [BatchSize, TopK]
+    TORCH_CHECK(expert_ids.dim() == 2, "expert_ids must be 2D [BatchSize, TopK]");
+    TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D [BatchSize, TopK]");
+    TORCH_CHECK(expert_ids.sizes() == topk_weights.sizes(), "expert_ids and topk_weights shape mismatch");
 
-    // 此时 size(0) 就是总元素个数，即 top_k
-    int32_t top_k = expert_ids_flat.size(0);
-    // --- 修改结束 ---
+    int32_t batch_size = expert_ids.size(0);
+    int32_t top_k = expert_ids.size(1);
+    int32_t total_tokens = expert_ids.numel(); // BS * TopK
 
-    int32_t in_dim = x_in.numel();
+    // Flatten expert_ids and topk_weights for the kernel
+    at::Tensor expert_ids_flat = expert_ids.view({-1}).contiguous();
+    at::Tensor topk_weights_flat = topk_weights.view({-1}).contiguous();
+
+    // Input X: [BatchSize, InDim]
+    TORCH_CHECK(x_in.dim() == 2, "x_in must be 2D [BatchSize, InDim]");
+    TORCH_CHECK(x_in.size(0) == batch_size, "x_in batch size mismatch");
+    int32_t in_dim = x_in.size(1);
+
+    // Weights Check
+    // W13: [NumExperts, InDim, OutDim_Packed]
     int32_t num_experts = w13_weight.size(0);
-    
-    // W13 Checks
     int32_t w13_packed_out = w13_weight.size(2);
     int32_t inter_dim_2x = w13_packed_out * 8; 
     int32_t inter_dim = inter_dim_2x / 2;
-    TORCH_CHECK(w13_offsets.size(1) == (in_dim / 128), "W13 offsets Groups mismatch");
 
-    // W2 Checks
+    // W2: [NumExperts, InterDim, OutDim_Packed]
     int32_t out_dim = w2_weight.size(2) * 8;
-    TORCH_CHECK(w2_offsets.size(1) == (inter_dim / 128), "W2 offsets Groups mismatch");
 
-    at::Tensor y = at::zeros({1, out_dim}, x_in.options());
+    // Output Y: [BatchSize, OutDim]
+    at::Tensor y = at::zeros({batch_size, out_dim}, x_in.options());
     
-    // Workspace: W13 Output + SwiGLU Output
-    int64_t w13_out_elems = top_k * inter_dim * 2;
-    int64_t swiglu_out_elems = top_k * inter_dim;
-    at::Tensor workspace = at::empty({w13_out_elems + swiglu_out_elems}, x_in.options());
+    // Workspace Calculation
+    // W13 Output: [TotalTokens, 2 * InterDim]
+    // SwiGLU Output: [TotalTokens, InterDim]
+    int64_t w13_out_elems = (int64_t)total_tokens * inter_dim * 2;
+    int64_t swiglu_out_elems = (int64_t)total_tokens * inter_dim;
+    int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems;
+    
+    at::Tensor workspace = at::empty({total_workspace_elems}, x_in.options());
 
+    // 2. Kernel Launch
     auto acl_stream = c10_npu::getCurrentNPUStream();
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
 
     bool is_fp16 = (x_in.dtype() == at::kHalf);
 
-    // 注意：下面传递 data_ptr 时，必须使用 flattened 后的 tensor (expert_ids_flat, topk_weights_flat)
     if (is_fp16) {
-        ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_fp16)(
+        ACLRT_LAUNCH_KERNEL(fused_moe_small_bs_w4a16_fp16)(
             block_dim, acl_stream,
             const_cast<void *>(x_in.data_ptr()),
             const_cast<void *>(w13_weight.data_ptr()),
@@ -150,14 +164,14 @@ HOST_API at::Tensor fused_moe_w4a16_bs1(
             const_cast<void *>(w2_weight.data_ptr()),
             const_cast<void *>(w2_scales.data_ptr()),
             const_cast<void *>(w2_offsets.data_ptr()),
-            const_cast<void *>(expert_ids_flat.data_ptr()),   // <--- 更新这里
-            const_cast<void *>(topk_weights_flat.data_ptr()), // <--- 更新这里
+            const_cast<void *>(expert_ids_flat.data_ptr()),   
+            const_cast<void *>(topk_weights_flat.data_ptr()), 
             const_cast<void *>(workspace.data_ptr()),
             y.data_ptr(),
-            top_k, in_dim, inter_dim, out_dim, num_experts
+            total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
         );
     } else {
-        ACLRT_LAUNCH_KERNEL(fused_moe_bs1_w4a16_bf16)(
+        ACLRT_LAUNCH_KERNEL(fused_moe_small_bs_w4a16_bf16)(
             block_dim, acl_stream,
             const_cast<void *>(x_in.data_ptr()),
             const_cast<void *>(w13_weight.data_ptr()),
@@ -166,11 +180,11 @@ HOST_API at::Tensor fused_moe_w4a16_bs1(
             const_cast<void *>(w2_weight.data_ptr()),
             const_cast<void *>(w2_scales.data_ptr()),
             const_cast<void *>(w2_offsets.data_ptr()),
-            const_cast<void *>(expert_ids_flat.data_ptr()),   // <--- 更新这里
-            const_cast<void *>(topk_weights_flat.data_ptr()), // <--- 更新这里
+            const_cast<void *>(expert_ids_flat.data_ptr()),   
+            const_cast<void *>(topk_weights_flat.data_ptr()), 
             const_cast<void *>(workspace.data_ptr()),
             y.data_ptr(),
-            top_k, in_dim, inter_dim, out_dim, num_experts
+            total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
         );
     }
 

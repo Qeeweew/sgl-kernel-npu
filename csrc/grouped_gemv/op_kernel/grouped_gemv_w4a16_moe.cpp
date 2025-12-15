@@ -119,7 +119,7 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// Kernel Grouped Gemv (Enhanced with Templates & N-Tiling)
+// Kernel Grouped Gemv (Enhanced for BS > 1 with Task Distribution)
 // -----------------------------------------------------------------------------
 template<typename T, bool IS_BROADCAST_X=false, bool IS_WEIGHTED_SUM=false>
 class KernelGroupedGemvW4A16Moe {
@@ -128,10 +128,11 @@ public:
 
     __aicore__ inline void Init(AscendC::TPipe* pipe, GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets,
                                 GM_ADDR expert_ids, GM_ADDR y, GM_ADDR topk_weights,
-                                int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
+                                int32_t total_tokens, int32_t in_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
     {
         this->pipe = pipe;
-        this->top_k = top_k;
+        this->total_tokens = total_tokens; // BS * TopK
+        this->top_k = top_k;               // 用于计算 batch index
         this->in_dim = in_dim;
         this->out_dim = out_dim;
         this->out_dim_packed = out_dim / PACK_RATIO;
@@ -150,25 +151,17 @@ public:
         }
 
         // --- N-Tiling Constants ---
-        // 使用 TILE_N (2048) 进行 Buffer 分配，而不是 out_dim
         constexpr int32_t TILE_N = 2048;
         int32_t tile_n_packed = TILE_N / PACK_RATIO;
 
         // Pipe Init
-        // X: One group per load (Invariant to N-tiling)
         pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
-        
-        // W: Tiled loading (COMPUTE_ROWS * TILE_N_PACKED)
-        // 降低了单次 W 的内存需求
         pipe->InitBuffer(inQueueW, BUFFER_NUM, COMPUTE_ROWS * tile_n_packed * sizeof(int32_t));
-        
-        // Scale, Offset, Y: Tiled by TILE_N
         pipe->InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
         pipe->InitBuffer(inQueueOffset, BUFFER_NUM, TILE_N * sizeof(T));
         pipe->InitBuffer(outQueueY, BUFFER_NUM, TILE_N * sizeof(float)); 
 
         // Workspace CalcBuf calculation
-        // 所有与 N (out_dim) 相关的临时 Buffer 大小都改为 TILE_N
         uint32_t current_offset = 0;
         this->offset_group_acc = current_offset; current_offset += TILE_N * sizeof(float);
         this->offset_w_half = current_offset; current_offset += GROUP_TILE * TILE_N * sizeof(half);
@@ -183,44 +176,89 @@ public:
 
     __aicore__ inline void Process()
     {
-        const int32_t row_idx = GetBlockIdx() % top_k;
-        const int32_t expert_id = expertIdsGm.GetValue(row_idx);
+        // 1. 计算总任务数 (Rows * Groups)
+        int32_t total_tasks = total_tokens * num_groups;
         
-        // Task allocation: Parallelize over Groups (K dimension)
-        const int32_t g_idx = GetBlockIdx() / top_k;
-        const int32_t g_count = GetBlockNum() / top_k + ((row_idx < GetBlockNum() % top_k) ? 1 : 0);
+        // 2. 当前 Core 分配的任务范围
+        int32_t core_idx = GetBlockIdx();
+        int32_t core_num = GetBlockNum();
         
+        // 向上取整分配
+        int32_t tasks_per_core = (total_tasks + core_num - 1) / core_num;
+        int32_t start_task = core_idx * tasks_per_core;
+        int32_t end_task = start_task + tasks_per_core;
+        if (end_task > total_tasks) end_task = total_tasks;
+        
+        if (start_task >= end_task) return;
+
         constexpr int32_t TILE_N = 2048;
 
         // --- Outer Loop: Tile N dimension ---
-        // 这样可以保证 Buffer 不需要完整的 out_dim 大小
+        // 外层循环 N，保证 Buffer 复用
         for (int32_t n_start = 0; n_start < out_dim; n_start += TILE_N) {
             int32_t cur_n_len = (out_dim - n_start < TILE_N) ? (out_dim - n_start) : TILE_N;
             
-            // Output Accumulator (Global to this core's task for current N-Tile)
+            // 初始化 Accumulator
             outQueueY.AllocTensor<T>(y_local); 
             auto global_acc = y_local.template ReinterpretCast<float>();
-            Duplicate(global_acc, 0.0f, cur_n_len); // Init Accumulator for this tile
+            Duplicate(global_acc, 0.0f, cur_n_len); 
 
-            // --- Inner Loop: Iterate all K-Groups assigned to this core ---
-            for (int32_t g = g_idx; g < num_groups; g += g_count) {
-                ProcessGroup(g, expert_id, row_idx, n_start, cur_n_len, global_acc); 
+            // 状态追踪：用于判断是否切换了 Row
+            int32_t current_row_idx = -1;
+            
+            // 预先解码第一个任务的 row
+            if (start_task < end_task) {
+                current_row_idx = start_task / num_groups;
             }
 
-            // Copy out the result for this N-Tile
-            outQueueY.EnQue(y_local);
-            CopyOut(row_idx, n_start, cur_n_len);
+            // --- Inner Loop: Iterate Tasks assigned to this core ---
+            for (int32_t task_id = start_task; task_id < end_task; ++task_id) {
+                
+                int32_t row_idx = task_id / num_groups;
+                int32_t group_idx = task_id % num_groups;
+
+                // 如果切换了 Row，必须先把上一个 Row 的结果写回 (Atomic Add)，并清空 Accumulator
+                if (row_idx != current_row_idx) {
+                    // 1. CopyOut (Atomic Add to GM)
+                    outQueueY.EnQue(y_local);
+                    CopyOut(current_row_idx, n_start, cur_n_len);
+                    
+                    // 2. Reset Accumulator for new row
+                    outQueueY.AllocTensor<T>(y_local);
+                    // 重新获取 tensor 引用因为 Alloc 后地址可能变化 (虽然在 AscendC 队列机制下通常是循环buffer)
+                    global_acc = y_local.template ReinterpretCast<float>();
+                    Duplicate(global_acc, 0.0f, cur_n_len);
+                    
+                    current_row_idx = row_idx;
+                }
+
+                // 获取 Expert ID (注意：expert_ids 是 [BS, TopK] flatten 后的，直接用 row_idx 索引)
+                int32_t expert_id = expertIdsGm.GetValue(row_idx);
+
+                // 计算当前 Group 贡献
+                ProcessGroup(group_idx, expert_id, row_idx, n_start, cur_n_len, global_acc); 
+            }
+
+            // Loop 结束，处理最后一个 Row 的残留数据
+            if (current_row_idx != -1) {
+                outQueueY.EnQue(y_local);
+                CopyOut(current_row_idx, n_start, cur_n_len);
+            }
         }
     }
 
 private:
-    __aicore__ inline void CopyInX(int32_t expert_id, int32_t row_idx, int32_t group_idx)
+    __aicore__ inline void CopyInX(int32_t row_idx, int32_t group_idx)
     {
-        // X Loading is independent of N-Tiling
         uint64_t x_offset;
         if constexpr (IS_BROADCAST_X) {
-            x_offset = group_idx * GROUP_SIZE;
+            // W13 阶段：输入 X 是 [BS, InDim]
+            // row_idx 范围是 [0, BS*TopK)，对应的 batch index 是 row_idx / top_k
+            int32_t batch_idx = row_idx / top_k;
+            x_offset = (uint64_t)batch_idx * this->in_dim + group_idx * GROUP_SIZE;
         } else {
+            // W2 阶段：输入是 Workspace [BS*TopK, InterDim]
+            // row_idx 直接对应行
             x_offset = (uint64_t)row_idx * this->in_dim + group_idx * GROUP_SIZE;
         }
 
@@ -330,7 +368,7 @@ private:
         LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(cur_n_len, offset_z_float);
         LocalTensor<float> reduce_buf = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_reduce_buf);
 
-        CopyInX(expert_id, row_idx, g_idx);
+        CopyInX(row_idx, g_idx);
 
         CopyInW(expert_id, g_idx, 0, n_offset, cur_n_len, w_local_arr[0]);
 
@@ -397,6 +435,8 @@ private:
         LocalTensor<float> y_fp32 = y_local.template ReinterpretCast<float>();
 
         if constexpr (IS_WEIGHTED_SUM) {
+            // W2 阶段：需要乘 TopK Weight
+            // topkWeightsGm 是 [BS * TopK]
             float w_val = topkWeightsGm.GetValue(row_idx);
             Muls(y_fp32, y_fp32, w_val, cur_n_len);
         }
@@ -408,12 +448,16 @@ private:
 
         // Atomic Add result to global memory
         AscendC::SetAtomicAdd<T>();
+        
         if constexpr (IS_WEIGHTED_SUM) {
-            // Weighted sum output is [OutDim] (accumulated over TopK rows usually, assuming yGm is setup for that)
-            // Offset by n_offset
-            DataCopy(yGm[n_offset], y_local, cur_n_len);
+            // W2 Output: [BS, OutDim]
+            // 需要聚合回 Batch 维度
+            int32_t batch_idx = row_idx / top_k;
+            uint64_t y_offset = (uint64_t)batch_idx * this->out_dim + n_offset;
+            DataCopy(yGm[y_offset], y_local, cur_n_len);
         } else {
-            // Standard output is [TopK, OutDim]
+            // W13 Output: [BS * TopK, OutDim] (Workspace)
+            // 保持展开维度
             uint64_t y_offset = (uint64_t)row_idx * this->out_dim + n_offset;
             DataCopy(yGm[y_offset], y_local, cur_n_len);
         }
@@ -449,31 +493,32 @@ private:
     int32_t out_dim_packed;
     int32_t num_experts;
     int32_t num_groups;
+    int32_t total_tokens;
 };
 
 // -----------------------------------------------------------------------------
-// Fused Kernel Implementation
+// Fused Kernel Implementation (BS <= 4)
 // -----------------------------------------------------------------------------
 template<typename T>
-__aicore__ inline void fused_moe_bs1_impl(
+__aicore__ inline void fused_moe_small_bs_impl(
     GM_ADDR x, 
     GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,
     GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
     GM_ADDR workspace, GM_ADDR y,
-    int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
+    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
 { 
     AscendC::TPipe pipe;
     
     // Workspace layout calculation
-    // Workspace 1: W13 Output [TopK, 2 * InterDim]
+    // Workspace 1: W13 Output [TotalTokens, 2 * InterDim]
     GM_ADDR w13_out_ptr = workspace;
-    uint64_t w13_out_size = (uint64_t)top_k * (inter_dim * 2) * sizeof(T);
+    uint64_t w13_out_size = (uint64_t)total_tokens * (inter_dim * 2) * sizeof(T);
     
-    // Workspace 2: SwiGLU Output [TopK, InterDim] (Input to W2)
+    // Workspace 2: SwiGLU Output [TotalTokens, InterDim] (Input to W2)
     GM_ADDR w2_in_ptr = (GM_ADDR)((__gm__ uint8_t*)workspace + w13_out_size);
 
-    // Phase 0: Zero Out
+    // Phase 0: Zero Out Workspace (W13 Output area)
     {
         KernelZeroOut<T> zeroOp;
         zeroOp.Init(&pipe, w13_out_ptr, w13_out_size);
@@ -489,9 +534,10 @@ __aicore__ inline void fused_moe_bs1_impl(
     // ------------------------------------------------------------------------
     {
         // IS_BROADCAST_X = true, IS_WEIGHTED_SUM = false
+        // W13 需要 top_k 来计算 row_idx 对应的 batch_idx，从而广播输入 X
         KernelGroupedGemvW4A16Moe<T, true, false> op_w13;
         op_w13.Init(&pipe, x, w13_weight, w13_scales, w13_offsets, expert_ids, w13_out_ptr, nullptr,
-                    top_k, in_dim, inter_dim * 2, num_experts);
+                    total_tokens, in_dim, inter_dim * 2, num_experts, top_k);
         op_w13.Process();
     }
 
@@ -503,8 +549,9 @@ __aicore__ inline void fused_moe_bs1_impl(
     // Phase 2: SwiGLU Activation
     // ------------------------------------------------------------------------
     {
+        // SwiGLU 只需要知道总 Token 数
         KernelSwiGLU<T> op_act;
-        op_act.Init(&pipe, w13_out_ptr, w2_in_ptr, top_k, inter_dim);
+        op_act.Init(&pipe, w13_out_ptr, w2_in_ptr, total_tokens, inter_dim);
         op_act.Process();
     }
 
@@ -517,9 +564,10 @@ __aicore__ inline void fused_moe_bs1_impl(
     // ------------------------------------------------------------------------
     {
         // IS_BROADCAST_X = false, IS_WEIGHTED_SUM = true
+        // W2 需要 top_k 来计算 row_idx 对应的 batch_idx，从而将结果累加到输出 Y
         KernelGroupedGemvW4A16Moe<T, false, true> op_w2;
         op_w2.Init(&pipe, w2_in_ptr, w2_weight, w2_scales, w2_offsets, expert_ids, y, topk_weights,
-                   top_k, inter_dim, out_dim, num_experts);
+                   total_tokens, inter_dim, out_dim, num_experts, top_k);
         op_w2.Process();
     }
 }
@@ -527,45 +575,48 @@ __aicore__ inline void fused_moe_bs1_impl(
 // -----------------------------------------------------------------------------
 // Extern C Entry Points
 // -----------------------------------------------------------------------------
-extern "C" __global__ __aicore__ void fused_moe_bs1_w4a16_fp16(
+
+// Fused MoE FP16
+extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,  GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
-    int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
+    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_bs1_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
+    fused_moe_small_bs_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k);
 }
 
-extern "C" __global__ __aicore__ void fused_moe_bs1_w4a16_bf16(
+// Fused MoE BF16
+extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_bf16(
     GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets, GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
-    int32_t top_k, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts)
+    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_bs1_impl<bfloat16_t>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, top_k, in_dim, inter_dim, out_dim, num_experts);
+    fused_moe_small_bs_impl<bfloat16_t>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k);
 }
 
-
-// 导出 FP16 版本
+// Standalone GEMV FP16 (Updated Interface)
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
     GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
-    int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
+    int32_t total_tokens, int32_t in_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::TPipe pipe;
     KernelGroupedGemvW4A16Moe<half, false, false> op;
-    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
+    // Standalone GEMV 通常不需要 Broadcast X，top_k 主要用于兼容性或特定逻辑
+    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, total_tokens, in_dim, out_dim, num_experts, top_k);
     op.Process();
 }
 
-// 导出 BF16 版本
+// Standalone GEMV BF16 (Updated Interface)
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_bf16(
     GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
-    int32_t top_k, int32_t in_dim, int32_t out_dim, int32_t num_experts)
+    int32_t total_tokens, int32_t in_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::TPipe pipe;
     KernelGroupedGemvW4A16Moe<bfloat16_t, false, false> op;
-    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, top_k, in_dim, out_dim, num_experts);
+    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, total_tokens, in_dim, out_dim, num_experts, top_k);
     op.Process();
 }
