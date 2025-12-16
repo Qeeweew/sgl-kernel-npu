@@ -178,18 +178,30 @@ public:
     {
         // 1. 计算总任务数 (Rows * Groups)
         int32_t total_tasks = total_tokens * num_groups;
-        
-        // 2. 当前 Core 分配的任务范围
         int32_t core_idx = GetBlockIdx();
         int32_t core_num = GetBlockNum();
-        
-        // 向上取整分配
-        int32_t tasks_per_core = (total_tasks + core_num - 1) / core_num;
-        int32_t start_task = core_idx * tasks_per_core;
-        int32_t end_task = start_task + tasks_per_core;
-        if (end_task > total_tasks) end_task = total_tasks;
-        
-        if (start_task >= end_task) return;
+
+        // 基本分配和余数
+        int32_t base = total_tasks / core_num;
+        int32_t rem  = total_tasks % core_num;
+
+        // 计算当前核的起始任务
+        int32_t start_task;
+        int32_t task_cnt;
+
+        if (core_idx < rem) {
+            // 前 rem 个核多分配 1 个
+            task_cnt = base + 1;
+            start_task = core_idx * (base + 1);
+        } else {
+            task_cnt = base;
+            start_task = rem * (base + 1) + (core_idx - rem) * base;
+        }
+
+        int32_t end_task = start_task + task_cnt;
+
+        // 没有任务直接返回
+        if (task_cnt <= 0) return;
 
         constexpr int32_t TILE_N = 2048;
 
@@ -328,27 +340,17 @@ private:
 
         LocalTensor<uint64_t> x_u64 = x_full_half.ReinterpretCast<uint64_t>();
         constexpr int STEP = 4;
+        half x_val_buf[COMPUTE_ROWS];
+        uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
+        for (int i = 0; i < COMPUTE_ROWS / STEP; ++i) {
+            x_val_buf_u64[i] = x_u64.GetValue(x_offset_idx / STEP + i);
+        }
 
         for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
-            LocalTensor<int4b_t> w_int4 =
-                w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
-
-            half x_val_buf[GROUP_TILE];
-            uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
-
-            for (int k = 0; k < GROUP_TILE; k += STEP) {
-                x_val_buf_u64[k / STEP] =
-                    x_u64.GetValue((x_offset_idx + i + k) / STEP);
-            }
-
-            Cast(w_half, w_int4, RoundMode::CAST_NONE,
-                GROUP_TILE * tile_n);
-
+            LocalTensor<int4b_t> w_int4 = w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
+            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * tile_n);
             for (int k = 0; k < GROUP_TILE; ++k) {
-                Axpy(group_acc_xw,
-                    w_half[k * tile_n],
-                    x_val_buf[k],
-                    tile_n);
+                Axpy(group_acc_xw, w_half[k * tile_n], x_val_buf[i + k], tile_n);
             }
         }
     }
