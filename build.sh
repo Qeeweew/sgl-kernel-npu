@@ -135,10 +135,6 @@ function build_kernels()
     fi
     mkdir -p $BUILD_DIR
 
-    cmake $COMPILE_OPTIONS -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" -DASCEND_HOME_PATH=$ASCEND_HOME_PATH -DASCEND_INCLUDE_DIR=$ASCEND_INCLUDE_DIR -DSOC_VERSION=$SOC_VERSION -DBUILD_DEEPEP_MODULE=$BUILD_DEEPEP_MODULE -DBUILD_KERNELS_MODULE=$BUILD_KERNELS_MODULE -B "$BUILD_DIR" -S .
-    cmake --build "$BUILD_DIR" -j8 && cmake --build "$BUILD_DIR" --target install
-    # 2. 移除 -G Ninja，回退到默认的 Make (解决 KeyError 报错)
-    # CMake 会自动生成 Makefile
     cmake $COMPILE_OPTIONS \
         -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
         -DASCEND_HOME_PATH=$ASCEND_HOME_PATH \
@@ -149,8 +145,7 @@ function build_kernels()
         -S .
     
     # 3. 使用所有核心进行编译
-    cmake --build "$BUILD_DIR" -j"${MAX_JOBS}"
-    cmake --build "$BUILD_DIR" --target install
+    cmake --build "$BUILD_DIR" -j"${MAX_JOBS}" --target install
     cd -
 }
 
