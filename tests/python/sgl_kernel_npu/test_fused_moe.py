@@ -203,11 +203,11 @@ def run_test_bs1():
     print("=" * 60)
 
     # --- 配置参数 (保持不变) ---
-    BATCH_SIZE = 1
+    BATCH_SIZE = 4
     TOP_K = 8
     NUM_EXPERTS = 128
-    HIDDEN_SIZE = 4096 // 4  # 512
-    INTER_SIZE = 1536
+    HIDDEN_SIZE = 2048
+    INTER_SIZE = 768
     GROUP_SIZE = 128
     
     device = torch.device("npu:0")

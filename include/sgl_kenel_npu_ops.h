@@ -87,18 +87,18 @@ void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
                               const at::Tensor &host_indices, int64_t page_size,
                               int64_t direction, int64_t flags);
 
-at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
-                       at::Tensor &y, int64_t slice_offset, int64_t slice_size);
+// at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
+//                        at::Tensor &y, int64_t slice_offset, int64_t slice_size);
 
-void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
-                 at::Tensor &y, double scale);
+// void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
+//                  at::Tensor &y, double scale);
 
-at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight,
-                       at::Tensor &lora_indices, at::Tensor &seq_len,
-                       at::Tensor &y, int64_t slice_offset, int64_t slice_size);
+// at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight,
+//                        at::Tensor &lora_indices, at::Tensor &seq_len,
+//                        at::Tensor &y, int64_t slice_offset, int64_t slice_size);
 
-void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices,
-                 at::Tensor &seq_len, at::Tensor &y, double scale);
+// void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices,
+//                  at::Tensor &seq_len, at::Tensor &y, double scale);
 
 #ifdef BUILD_CATLASS_MODULE
 void catlass_matmul_basic(const at::Tensor &tensor_a,
@@ -106,14 +106,14 @@ void catlass_matmul_basic(const at::Tensor &tensor_a,
                           c10::optional<c10::string_view> format_mode);
 #endif
 
-at::Tensor lightning_indexer(
-    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
-    const c10::optional<at::Tensor> &actual_seq_lengths_query,
-    const c10::optional<at::Tensor> &actual_seq_lengths_key,
-    const c10::optional<at::Tensor> &block_table,
-    c10::optional<c10::string_view> layout_query,
-    c10::optional<c10::string_view> layout_key,
-    c10::optional<int64_t> sparse_count, c10::optional<int64_t> sparse_mode);
+// at::Tensor lightning_indexer(
+//     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+//     const c10::optional<at::Tensor> &actual_seq_lengths_query,
+//     const c10::optional<at::Tensor> &actual_seq_lengths_key,
+//     const c10::optional<at::Tensor> &block_table,
+//     c10::optional<c10::string_view> layout_query,
+//     c10::optional<c10::string_view> layout_key,
+//     c10::optional<int64_t> sparse_count, c10::optional<int64_t> sparse_mode);
 
 } // namespace npu_kernel
 

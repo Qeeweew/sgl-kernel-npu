@@ -66,18 +66,18 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor device_v, Tensor host_v, "
         "Tensor device_indices, Tensor host_indices, int page_size, int direct, int flags) -> ()");
 
-    m.def(
-        "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
-        "            int slice_offset, int slice_size) -> Tensor");
+    // m.def(
+    //     "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
+    //     "            int slice_offset, int slice_size) -> Tensor");
 
-    m.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
+    // m.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
 
-    m.def(
-        "sgmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y,"
-        "            int slice_offset, int slice_size) -> Tensor");
+    // m.def(
+    //     "sgmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y,"
+    //     "            int slice_offset, int slice_size) -> Tensor");
 
-    m.def(
-        "sgmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y, float scale) -> ()");
+    // m.def(
+    //     "sgmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y, float scale) -> ()");
 
     m.def(
         "grouped_gemv_w4a16_moe(Tensor x, Tensor weight, Tensor scales, Tensor offsets, Tensor expert_ids) "
@@ -95,11 +95,11 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def("catlass_matmul_basic(Tensor tensor_a, Tensor tensor_b, Tensor(a!) tensor_c, str? format_mode=None) -> ()");
 #endif
 
-    m.def(
-        "lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor? actual_seq_lengths_query=None, "
-        "Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, "
-        "str? layout_query=None, str? layout_key=None, "
-        "int? sparse_count=None, int? sparse_mode=None) -> Tensor");
+    // m.def(
+    //     "lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor? actual_seq_lengths_query=None, "
+    //     "Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, "
+    //     "str? layout_query=None, str? layout_key=None, "
+    //     "int? sparse_count=None, int? sparse_mode=None) -> Tensor");
 }
 }  // namespace
 
@@ -124,17 +124,17 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("transfer_kv_dim_exchange", TORCH_FN(sglang::npu_kernel::transfer_kv_dim_exchange));
 
-    m.impl("bgmv_expand", TORCH_FN(sglang::npu_kernel::bgmv_expand));
+    // m.impl("bgmv_expand", TORCH_FN(sglang::npu_kernel::bgmv_expand));
 
-    m.impl("bgmv_shrink", TORCH_FN(sglang::npu_kernel::bgmv_shrink));
+    // m.impl("bgmv_shrink", TORCH_FN(sglang::npu_kernel::bgmv_shrink));
 
-    m.impl("sgmv_expand", TORCH_FN(sglang::npu_kernel::sgmv_expand));
+    // m.impl("sgmv_expand", TORCH_FN(sglang::npu_kernel::sgmv_expand));
 
-    m.impl("sgmv_shrink", TORCH_FN(sglang::npu_kernel::sgmv_shrink));
+    // m.impl("sgmv_shrink", TORCH_FN(sglang::npu_kernel::sgmv_shrink));
 
     m.impl("grouped_gemv_w4a16_moe", TORCH_FN(sglang::npu_kernel::grouped_gemv_w4a16_moe));
 
-    m.impl("fused_moe_w4a16_bs1", TORCH_FN(sglang::npu_kernel::fused_moe_w4a16_bs1));
+    m.impl("fused_moe_w4a16_small_bs", TORCH_FN(sglang::npu_kernel::fused_moe_w4a16_small_bs));
 
     m.impl("gemv_w4a16", TORCH_FN(sglang::npu_kernel::gemv_w4a16));
 
@@ -142,6 +142,6 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("catlass_matmul_basic", TORCH_FN(sglang::npu_kernel::catlass_matmul_basic));
 #endif
 
-    m.impl("lightning_indexer", TORCH_FN(sglang::npu_kernel::lightning_indexer));
+    // m.impl("lightning_indexer", TORCH_FN(sglang::npu_kernel::lightning_indexer));
 }
 }  // namespace
