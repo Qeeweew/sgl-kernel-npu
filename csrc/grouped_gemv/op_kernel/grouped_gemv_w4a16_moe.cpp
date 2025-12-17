@@ -155,7 +155,7 @@ public:
         int32_t tile_n_packed = TILE_N / PACK_RATIO;
 
         // Pipe Init
-        pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T) + 32); 
+        pipe->InitBuffer(inQueueX, BUFFER_NUM, GROUP_SIZE * sizeof(T)); 
         pipe->InitBuffer(inQueueW, BUFFER_NUM, COMPUTE_ROWS * tile_n_packed * sizeof(int32_t));
         pipe->InitBuffer(inQueueScale, BUFFER_NUM, TILE_N * sizeof(T));
         pipe->InitBuffer(inQueueOffset, BUFFER_NUM, TILE_N * sizeof(T));
@@ -163,11 +163,9 @@ public:
 
         // Workspace CalcBuf calculation
         uint32_t current_offset = 0;
-        this->offset_group_acc = current_offset; current_offset += TILE_N * sizeof(float);
+        this->offset_group_acc = current_offset; current_offset += TILE_N * sizeof(half) + 256;
         this->offset_w_half = current_offset; current_offset += GROUP_TILE * TILE_N * sizeof(half);
         this->offset_x_float = current_offset; current_offset += GROUP_SIZE * sizeof(float);
-        this->offset_x_half = current_offset; current_offset += GROUP_SIZE * sizeof(half);
-        this->offset_s_float = current_offset; current_offset += TILE_N * sizeof(float);
         this->offset_z_float = current_offset; current_offset += TILE_N * sizeof(float);
         this->offset_reduce_buf = current_offset; current_offset += GROUP_SIZE * sizeof(float);
         
@@ -333,7 +331,7 @@ private:
         int32_t tile_n,
         int32_t tile_n_packed,
         LocalTensor<half>& x_full_half,
-        LocalTensor<float>& group_acc_xw)
+        LocalTensor<half>& group_acc_xw)
     {
         LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(
             GROUP_TILE * tile_n, offset_w_half);
@@ -361,12 +359,9 @@ private:
                                       LocalTensor<float>& global_acc)
     {
         // Buffers (Allocated size is TILE_N, use cur_n_len for calculation)
-        LocalTensor<float> group_acc = calcBuf.GetWithOffset<float>(cur_n_len, offset_group_acc);
+        LocalTensor<half> group_acc = calcBuf.GetWithOffset<half>(cur_n_len, offset_group_acc);
         LocalTensor<half> w_half = calcBuf.GetWithOffset<half>(GROUP_TILE * cur_n_len, offset_w_half);
         LocalTensor<float> x_float_full = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_x_float);
-        LocalTensor<half> x_half_full = calcBuf.GetWithOffset<half>(GROUP_SIZE, offset_x_half);
-        
-        LocalTensor<float> s_float = calcBuf.GetWithOffset<float>(cur_n_len, offset_s_float);
         LocalTensor<float> z_float = calcBuf.GetWithOffset<float>(cur_n_len, offset_z_float);
         LocalTensor<float> reduce_buf = calcBuf.GetWithOffset<float>(GROUP_SIZE, offset_reduce_buf);
 
@@ -375,14 +370,13 @@ private:
         CopyInW(expert_id, g_idx, 0, n_offset, cur_n_len, w_local_arr[0]);
 
         // Matrix Multiplication Loop
-        Duplicate(group_acc, 0.0f, cur_n_len);
+        Duplicate(group_acc, (half) 0.0f, cur_n_len);
 
         // Process X (T -> Float -> Half)
         inQueueX.DeQue(x_local);
 
 
         Cast(x_float_full, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
-        Cast(x_half_full, x_float_full, RoundMode::CAST_ROUND, GROUP_SIZE);
         inQueueX.FreeTensor(x_local);
         ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
         
@@ -406,7 +400,7 @@ private:
                 k_inner,
                 cur_n_len,
                 cur_n_packed,
-                x_half_full,
+                x_local,
                 group_acc);
 
             // 4. 释放
@@ -418,17 +412,17 @@ private:
         float group_x_sum = reduce_buf.GetValue(0);
 
         // Process Scale & Offset
-        inQueueScale.DeQue<T>(s_local);
-        inQueueOffset.DeQue<T>(z_local);
-        Cast(s_float, s_local, RoundMode::CAST_NONE, cur_n_len);
-        Cast(z_float, z_local, RoundMode::CAST_NONE, cur_n_len);
-        inQueueScale.FreeTensor(s_local);
-        inQueueOffset.FreeTensor(z_local);
+        inQueueScale.DeQue(s_local);
+        inQueueOffset.DeQue(z_local);
 
         // Finalize Correction
-        Mul(z_float, z_float, s_float, cur_n_len);
+        Mul(z_local, z_local, s_local, cur_n_len);
+        Cast(z_float, z_local, RoundMode::CAST_NONE, cur_n_len);
         Axpy(global_acc, z_float, group_x_sum, cur_n_len);
-        MulAddDst(global_acc, group_acc, s_float, cur_n_len);
+        MulAddDst(global_acc, group_acc, s_local, cur_n_len);
+
+        inQueueScale.FreeTensor(s_local);
+        inQueueOffset.FreeTensor(z_local);
     }
 
     __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_offset, int32_t cur_n_len)
@@ -588,16 +582,6 @@ extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     fused_moe_small_bs_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k);
 }
 
-// Fused MoE BF16
-extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_bf16(
-    GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets, GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
-    GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
-    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_small_bs_impl<bfloat16_t>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k);
-}
-
 // Standalone GEMV FP16 (Updated Interface)
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
     GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
@@ -607,18 +591,6 @@ extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
     AscendC::TPipe pipe;
     KernelGroupedGemvW4A16Moe<half, false, false> op;
     // Standalone GEMV 通常不需要 Broadcast X，top_k 主要用于兼容性或特定逻辑
-    op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, total_tokens, in_dim, out_dim, num_experts, top_k);
-    op.Process();
-}
-
-// Standalone GEMV BF16 (Updated Interface)
-extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_bf16(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets, GM_ADDR expert_ids, GM_ADDR y, 
-    int32_t total_tokens, int32_t in_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    AscendC::TPipe pipe;
-    KernelGroupedGemvW4A16Moe<bfloat16_t, false, false> op;
     op.Init(&pipe, x, weight, scales, offsets, expert_ids, y, nullptr, total_tokens, in_dim, out_dim, num_experts, top_k);
     op.Process();
 }

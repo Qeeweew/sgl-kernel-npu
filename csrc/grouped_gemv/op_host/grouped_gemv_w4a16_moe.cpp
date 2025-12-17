@@ -2,9 +2,7 @@
 #include "tiling/platform/platform_ascendc.h"
 // 包含生成的 Kernel Launch 头文件 (根据 Kernel 导出名)
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_fp16.h"
-#include "aclrtlaunch_grouped_gemv_w4a16_moe_bf16.h"
 #include "aclrtlaunch_fused_moe_small_bs_w4a16_fp16.h"
-#include "aclrtlaunch_fused_moe_small_bs_w4a16_bf16.h"
 #include "torch_helper.h"
 
 namespace sglang {
@@ -68,31 +66,18 @@ HOST_API at::Tensor grouped_gemv_w4a16_moe(const at::Tensor &x_in, const at::Ten
     int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
     auto acl_stream = c10_npu::getCurrentNPUStream();
 
-    bool is_fp16 = (x_in.dtype() == at::kHalf);
+    TORCH_CHECK(x_in.dtype() == at::kHalf, "FP16 support only!");
 
-    if (is_fp16) {
-        ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_fp16)
-        (block_dim, acl_stream,
-         const_cast<void *>(x_contiguous.data_ptr()),
-         const_cast<void *>(weight.data_ptr()),
-         const_cast<void *>(scales.data_ptr()),
-         const_cast<void *>(offsets.data_ptr()),
-         const_cast<void *>(expert_ids_flat.data_ptr()),
-         y.data_ptr(),
-         total_tokens, in_dim, out_dim, num_experts, top_k
-        );
-    } else { 
-        ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_bf16)
-        (block_dim, acl_stream,
-         const_cast<void *>(x_contiguous.data_ptr()),
-         const_cast<void *>(weight.data_ptr()),
-         const_cast<void *>(scales.data_ptr()),
-         const_cast<void *>(offsets.data_ptr()),
-         const_cast<void *>(expert_ids_flat.data_ptr()),
-         y.data_ptr(),
-         total_tokens, in_dim, out_dim, num_experts, top_k
-        );
-    }
+    ACLRT_LAUNCH_KERNEL(grouped_gemv_w4a16_moe_fp16)(
+        block_dim, acl_stream,
+        const_cast<void *>(x_contiguous.data_ptr()),
+        const_cast<void *>(weight.data_ptr()),
+        const_cast<void *>(scales.data_ptr()),
+        const_cast<void *>(offsets.data_ptr()),
+        const_cast<void *>(expert_ids_flat.data_ptr()),
+        y.data_ptr(),
+        total_tokens, in_dim, out_dim, num_experts, top_k
+    );
 
     return y;
 }
@@ -152,41 +137,23 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
 
-    bool is_fp16 = (x_in.dtype() == at::kHalf);
+    TORCH_CHECK(x_in.dtype() == at::kHalf, "FP16 support only!");
 
-    if (is_fp16) {
-        ACLRT_LAUNCH_KERNEL(fused_moe_small_bs_w4a16_fp16)(
-            block_dim, acl_stream,
-            const_cast<void *>(x_in.data_ptr()),
-            const_cast<void *>(w13_weight.data_ptr()),
-            const_cast<void *>(w13_scales.data_ptr()),
-            const_cast<void *>(w13_offsets.data_ptr()),
-            const_cast<void *>(w2_weight.data_ptr()),
-            const_cast<void *>(w2_scales.data_ptr()),
-            const_cast<void *>(w2_offsets.data_ptr()),
-            const_cast<void *>(expert_ids_flat.data_ptr()),   
-            const_cast<void *>(topk_weights_flat.data_ptr()), 
-            const_cast<void *>(workspace.data_ptr()),
-            y.data_ptr(),
-            total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
-        );
-    } else {
-        ACLRT_LAUNCH_KERNEL(fused_moe_small_bs_w4a16_bf16)(
-            block_dim, acl_stream,
-            const_cast<void *>(x_in.data_ptr()),
-            const_cast<void *>(w13_weight.data_ptr()),
-            const_cast<void *>(w13_scales.data_ptr()),
-            const_cast<void *>(w13_offsets.data_ptr()),
-            const_cast<void *>(w2_weight.data_ptr()),
-            const_cast<void *>(w2_scales.data_ptr()),
-            const_cast<void *>(w2_offsets.data_ptr()),
-            const_cast<void *>(expert_ids_flat.data_ptr()),   
-            const_cast<void *>(topk_weights_flat.data_ptr()), 
-            const_cast<void *>(workspace.data_ptr()),
-            y.data_ptr(),
-            total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
-        );
-    }
+    ACLRT_LAUNCH_KERNEL(fused_moe_small_bs_w4a16_fp16)(
+        block_dim, acl_stream,
+        const_cast<void *>(x_in.data_ptr()),
+        const_cast<void *>(w13_weight.data_ptr()),
+        const_cast<void *>(w13_scales.data_ptr()),
+        const_cast<void *>(w13_offsets.data_ptr()),
+        const_cast<void *>(w2_weight.data_ptr()),
+        const_cast<void *>(w2_scales.data_ptr()),
+        const_cast<void *>(w2_offsets.data_ptr()),
+        const_cast<void *>(expert_ids_flat.data_ptr()),   
+        const_cast<void *>(topk_weights_flat.data_ptr()), 
+        const_cast<void *>(workspace.data_ptr()),
+        y.data_ptr(),
+        total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
+    );
 
     return y;
 }

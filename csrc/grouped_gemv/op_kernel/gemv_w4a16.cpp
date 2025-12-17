@@ -303,27 +303,17 @@ private:
 
         LocalTensor<uint64_t> x_u64 = x_full_half.ReinterpretCast<uint64_t>();
         constexpr int STEP = 4;
+        half x_val_buf[COMPUTE_ROWS];
+        uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
+        for (int i = 0; i < COMPUTE_ROWS / STEP; ++i) {
+            x_val_buf_u64[i] = x_u64.GetValue(x_offset_idx / STEP + i);
+        }
 
         for (int i = 0; i < COMPUTE_ROWS; i += GROUP_TILE) {
-            LocalTensor<int4b_t> w_int4 =
-                w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
-
-            half x_val_buf[GROUP_TILE];
-            uint64_t* x_val_buf_u64 = (uint64_t*)x_val_buf;
-
-            for (int k = 0; k < GROUP_TILE; k += STEP) {
-                x_val_buf_u64[k / STEP] =
-                    x_u64.GetValue((x_offset_idx + i + k) / STEP);
-            }
-
-            Cast(w_half, w_int4, RoundMode::CAST_NONE,
-                GROUP_TILE * tile_n);
-
+            LocalTensor<int4b_t> w_int4 = w_local[i * tile_n_packed].ReinterpretCast<int4b_t>();
+            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * tile_n);
             for (int k = 0; k < GROUP_TILE; ++k) {
-                Axpy(group_acc_xw,
-                    w_half[k * tile_n],
-                    x_val_buf[k],
-                    tile_n);
+                Axpy(group_acc_xw, w_half[k * tile_n], x_val_buf[i + k], tile_n);
             }
         }
     }
