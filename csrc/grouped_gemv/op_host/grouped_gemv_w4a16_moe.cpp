@@ -119,18 +119,30 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
 
     // W2: [NumExperts, InterDim, OutDim_Packed]
     int32_t out_dim = w2_weight.size(2) * 8;
+    TORCH_CHECK(in_dim == out_dim, "in_dim and out_dim must be equal for MoE");
 
-    // Output Y: [BatchSize, OutDim]
-    at::Tensor y = at::zeros({batch_size, out_dim}, x_in.options());
-    
     // Workspace Calculation
     // W13 Output: [TotalTokens, 2 * InterDim]
     // SwiGLU Output: [TotalTokens, InterDim]
     int64_t w13_out_elems = (int64_t)total_tokens * inter_dim * 2;
     int64_t swiglu_out_elems = (int64_t)total_tokens * inter_dim;
     int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems;
-    
-    at::Tensor workspace = at::empty({total_workspace_elems}, x_in.options());
+    int64_t y_elems = (int64_t)batch_size * out_dim;
+    int64_t total_elems = total_workspace_elems + y_elems;
+    at::Tensor buffer = at::empty({total_elems}, x_in.options());
+
+    at::Tensor y = buffer.narrow(
+        0,
+        0,
+        y_elems
+    ).view({batch_size, out_dim});
+
+    at::Tensor workspace = buffer.narrow(
+        0,                    // dim
+        y_elems,                    // start
+        total_workspace_elems // length
+    );
+
 
     // 2. Kernel Launch
     auto acl_stream = c10_npu::getCurrentNPUStream();
@@ -150,9 +162,8 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
         const_cast<void *>(w2_offsets.data_ptr()),
         const_cast<void *>(expert_ids_flat.data_ptr()),   
         const_cast<void *>(topk_weights_flat.data_ptr()), 
-        const_cast<void *>(workspace.data_ptr()),
-        y.data_ptr(),
-        total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k
+        const_cast<void *>(buffer.data_ptr()),
+        batch_size, in_dim, inter_dim, num_experts, top_k
     );
 
     return y;

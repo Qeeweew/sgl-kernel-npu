@@ -13,6 +13,7 @@ constexpr int32_t GROUP_SIZE = 128; // Updated to 128
 constexpr int32_t COMPUTE_ROWS = 32; // Block size for Weight loading within a group
 constexpr int32_t PACK_RATIO = 8;
 constexpr int32_t GROUP_TILE = 8;
+constexpr int32_t TILE_N = 2048;
 
 // -----------------------------------------------------------------------------
 // Kernel SwiGLU (Phase 2)
@@ -151,7 +152,6 @@ public:
         }
 
         // --- N-Tiling Constants ---
-        constexpr int32_t TILE_N = 2048;
         int32_t tile_n_packed = TILE_N / PACK_RATIO;
 
         // Pipe Init
@@ -501,23 +501,25 @@ __aicore__ inline void fused_moe_small_bs_impl(
     GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,
     GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
-    GM_ADDR workspace, GM_ADDR y,
-    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
+    GM_ADDR workspace, int32_t batch_size, int32_t hidden_size, int32_t inter_size, int32_t num_experts, int32_t top_k)
 { 
     AscendC::TPipe pipe;
+
+    int32_t total_tokens = batch_size * top_k;
     
     // Workspace layout calculation
+    GM_ADDR y = workspace;
+    uint64_t y_size = (uint64_t) batch_size * hidden_size * sizeof(T);
     // Workspace 1: W13 Output [TotalTokens, 2 * InterDim]
-    GM_ADDR w13_out_ptr = workspace;
-    uint64_t w13_out_size = (uint64_t)total_tokens * (inter_dim * 2) * sizeof(T);
-    
+    GM_ADDR w13_out_ptr =  (GM_ADDR)((__gm__ uint8_t*)y + y_size);
+    uint64_t w13_out_size = (uint64_t)total_tokens * (inter_size * 2) * sizeof(T);
     // Workspace 2: SwiGLU Output [TotalTokens, InterDim] (Input to W2)
-    GM_ADDR w2_in_ptr = (GM_ADDR)((__gm__ uint8_t*)workspace + w13_out_size);
+    GM_ADDR w2_in_ptr = (GM_ADDR)((__gm__ uint8_t*)w13_out_ptr + w13_out_size);
 
     // Phase 0: Zero Out Workspace (W13 Output area)
     {
-        KernelZeroOut<T> zeroOp;
-        zeroOp.Init(&pipe, w13_out_ptr, w13_out_size / sizeof(T));
+        KernelZeroOut<half> zeroOp;
+        zeroOp.Init(&pipe, workspace, (y_size + w13_out_size) / sizeof(half));
         zeroOp.Process();
     }
 
@@ -533,7 +535,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
         // W13 需要 top_k 来计算 row_idx 对应的 batch_idx，从而广播输入 X
         KernelGroupedGemvW4A16Moe<T, true, false> op_w13;
         op_w13.Init(&pipe, x, w13_weight, w13_scales, w13_offsets, expert_ids, w13_out_ptr, nullptr,
-                    total_tokens, in_dim, inter_dim * 2, num_experts, top_k);
+                    total_tokens, hidden_size, inter_size * 2, num_experts, top_k);
         op_w13.Process();
     }
 
@@ -547,7 +549,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
     {
         // SwiGLU 只需要知道总 Token 数
         KernelSwiGLU<T> op_act;
-        op_act.Init(&pipe, w13_out_ptr, w2_in_ptr, total_tokens, inter_dim);
+        op_act.Init(&pipe, w13_out_ptr, w2_in_ptr, total_tokens, inter_size);
         op_act.Process();
     }
 
@@ -563,7 +565,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
         // W2 需要 top_k 来计算 row_idx 对应的 batch_idx，从而将结果累加到输出 Y
         KernelGroupedGemvW4A16Moe<T, false, true> op_w2;
         op_w2.Init(&pipe, w2_in_ptr, w2_weight, w2_scales, w2_offsets, expert_ids, y, topk_weights,
-                   total_tokens, inter_dim, out_dim, num_experts, top_k);
+                   total_tokens, inter_size, hidden_size, num_experts, top_k);
         op_w2.Process();
     }
 }
@@ -575,11 +577,11 @@ __aicore__ inline void fused_moe_small_bs_impl(
 // Fused MoE FP16
 extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     GM_ADDR x, GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,  GM_ADDR w2_weight, GM_ADDR w2_scales, GM_ADDR w2_offsets,
-    GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace, GM_ADDR y,
-    int32_t total_tokens, int32_t in_dim, int32_t inter_dim, int32_t out_dim, int32_t num_experts, int32_t top_k)
+    GM_ADDR expert_ids, GM_ADDR topk_weights, GM_ADDR workspace,
+    int32_t total_tokens, int32_t hidden_size, int32_t inter_size, int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    fused_moe_small_bs_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, y, total_tokens, in_dim, inter_dim, out_dim, num_experts, top_k);
+    fused_moe_small_bs_impl<half>(x, w13_weight, w13_scales, w13_offsets, w2_weight, w2_scales, w2_offsets, expert_ids, topk_weights, workspace, total_tokens, hidden_size, inter_size, num_experts, top_k);
 }
 
 // Standalone GEMV FP16 (Updated Interface)
