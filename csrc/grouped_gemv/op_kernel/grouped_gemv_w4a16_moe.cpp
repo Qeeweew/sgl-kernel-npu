@@ -517,7 +517,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
     // Phase 0: Zero Out Workspace (W13 Output area)
     {
         KernelZeroOut<T> zeroOp;
-        zeroOp.Init(&pipe, w13_out_ptr, w13_out_size);
+        zeroOp.Init(&pipe, w13_out_ptr, w13_out_size / sizeof(T));
         zeroOp.Process();
     }
 
