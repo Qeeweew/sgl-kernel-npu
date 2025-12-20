@@ -1,6 +1,5 @@
 #define K_MAX_SHAPE_DIM 0
 #include "kernel_operator.h"
-#include "zero_out_impl.h"
 
 using namespace AscendC;
 

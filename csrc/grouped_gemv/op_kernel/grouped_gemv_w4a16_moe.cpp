@@ -1,6 +1,5 @@
 #define K_MAX_SHAPE_DIM 0
 #include "kernel_operator.h"
-#include "zero_out_impl.h"
 #include <type_traits>
 
 using namespace AscendC;
@@ -41,21 +40,16 @@ public:
         int32_t core_idx = GetBlockIdx();
         int32_t core_num = GetBlockNum();
 
+        Duplicate(tile, (T)0, TILE);
+        // V -> MTE3
+        SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+        WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+
         for (uint64_t base = (uint64_t)core_idx * TILE; base < total; base += (uint64_t)core_num * TILE) {
             uint32_t len = (uint32_t)((total - base < (uint64_t)TILE) ? (total - base) : TILE);
-
-            Duplicate(tile, (T)0, len);
-
-            // V -> MTE3
-            SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
-            WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
-
             DataCopy(dstGm[base], tile, len);
-
-            // MTE3 -> V (close pair immediately; we don't overlap)
-            SetFlag<HardEvent::MTE3_V>(EID_MTE3_V);
-            WaitFlag<HardEvent::MTE3_V>(EID_MTE3_V);
         }
+        DataSyncBarrier<MemDsbT::DDR>();
     }
 
 private:
@@ -67,7 +61,7 @@ private:
 // Kernel SwiGLU (Low-level, NO double-buffer; simple)
 // Layout: [Gate | Value] split at inter_dim
 // -----------------------------------------------------------------------------
-template<typename T, uint32_t TILE_LEN = 512>
+template<typename T, uint32_t TILE_LEN = 1024>
 class KernelSwiGLU {
 public:
     __aicore__ inline KernelSwiGLU() {}
@@ -349,29 +343,29 @@ private:
         }
 
         DataCopy(x_local, xGm[x_offset], GROUP_SIZE);
-        PrefetchW(expert_id, g_idx, 0, n_offset, cur_n_len, /*buf=*/0);
-
         SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
         WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+
+        PrefetchW(expert_id, g_idx, 0, n_offset, cur_n_len, /*buf=*/0);
+        SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
 
         // ----- init accum -----
         Duplicate(group_acc, (half)0.0f, cur_n_len);
 
         Cast(x_float_full, x_local, RoundMode::CAST_NONE, GROUP_SIZE);
-        ReduceSum(reduce_buf, x_float_full, reduce_buf, GROUP_SIZE);
+        WholeReduceSum<float>(reduce_buf, x_float_full, 64, GROUP_SIZE / 64, 1, 1, 8); 
+        BlockReduceSum<float>(reduce_buf, reduce_buf, 1, GROUP_SIZE / 64, 1, 1, 8);
 
         int32_t cur_n_packed = cur_n_len / PACK_RATIO;
 
         // W ping-pong
         // Important: because HardEvent::V_MTE2 uses ONE event_id globally,
         // we must ensure every SetFlag<V_MTE2>(1) is eventually waited before leaving ProcessGroup.
-        bool v_mte2_set_once = false;
-
         int ping = 0;
         for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += COMPUTE_ROWS) {
             // Wait current W ready (except first, already waited above)
+            WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
             if (k_inner != 0) {
-                WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
                 WaitFlag<HardEvent::V_MTE2>(EID_V_MTE2);
             }
 
@@ -397,12 +391,8 @@ private:
             ping ^= 1;
         }
 
-        // Wait SZ ready (pairs the last SetFlag<MTE2_V>(0) from last iteration)
-        WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
-
-
         float group_x_sum = reduce_buf.GetValue(0);
-
+        WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
         Mul(z_local, z_local, s_local, cur_n_len);
         Cast(z_float, z_local, RoundMode::CAST_NONE, cur_n_len);
         Axpy(global_acc, z_float, group_x_sum, cur_n_len);

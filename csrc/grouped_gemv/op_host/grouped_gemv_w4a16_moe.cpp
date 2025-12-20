@@ -139,7 +139,7 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
 
     at::Tensor workspace = buffer.narrow(
         0,                    // dim
-        y_elems,                    // start
+        y_elems,              // start
         total_workspace_elems // length
     );
 
