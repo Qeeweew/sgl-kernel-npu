@@ -155,11 +155,7 @@ private:
     int32_t inter_dim  = 0;
 };
 
-// -----------------------------------------------------------------------------
-// Kernel Grouped Gemv W4A16 Moe (Low-level)
-// Keep pipeline intent: W double buffer; SZ prefetch overlaps last compute.
-// -----------------------------------------------------------------------------
-template<typename T, bool IS_BROADCAST_X = false, bool IS_WEIGHTED_SUM = false>
+template<typename T>
 class KernelGroupedGemvW4A16Moe {
 public:
     __aicore__ inline KernelGroupedGemvW4A16Moe() {}
@@ -167,7 +163,8 @@ public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR offsets,
                                 GM_ADDR expert_ids, GM_ADDR y, GM_ADDR topk_weights,
                                 int32_t total_tokens, int32_t in_dim, int32_t out_dim,
-                                int32_t num_experts, int32_t top_k) {
+                                int32_t num_experts, int32_t top_k,
+                                bool is_broadcast_x, bool is_weighted_sum) {
         this->total_tokens = total_tokens;
         this->top_k = top_k;
         this->in_dim = in_dim;
@@ -175,6 +172,10 @@ public:
         this->out_dim_packed = out_dim / PACK_RATIO;
         this->num_experts = num_experts;
         this->num_groups = in_dim / GROUP_SIZE;
+        
+        // Runtime flags instead of templates
+        this->is_broadcast_x = is_broadcast_x;
+        this->is_weighted_sum = is_weighted_sum;
 
         xGm.SetGlobalBuffer((__gm__ T*)x);
         weightGm.SetGlobalBuffer((__gm__ int32_t*)weight);
@@ -183,7 +184,7 @@ public:
         expertIdsGm.SetGlobalBuffer((__gm__ int32_t*)expert_ids);
         yGm.SetGlobalBuffer((__gm__ T*)y);
 
-        if constexpr (IS_WEIGHTED_SUM) {
+        if (is_weighted_sum) {
             topkWeightsGm.SetGlobalBuffer((__gm__ float*)topk_weights);
         }
 
@@ -333,9 +334,9 @@ private:
     __aicore__ inline void ProcessGroup(int32_t g_idx, int32_t expert_id, int32_t row_idx,
                                         int32_t n_offset, int32_t cur_n_len,
                                         LocalTensor<float>& global_acc) {
-        // ----- CopyIn X + W0 (MTE2) -----
         uint64_t x_offset;
-        if constexpr (IS_BROADCAST_X) {
+        // Runtime branch instead of template
+        if (is_broadcast_x) {
             int32_t batch_idx = row_idx / top_k;
             x_offset = (uint64_t)batch_idx * (uint64_t)in_dim + (uint64_t)g_idx * GROUP_SIZE;
         } else {
@@ -402,7 +403,8 @@ private:
     __aicore__ inline void CopyOut(int32_t row_idx, int32_t n_offset, int32_t cur_n_len) {
         if (row_idx < 0) return;
 
-        if constexpr (IS_WEIGHTED_SUM) {
+        // Runtime branch instead of template
+        if (is_weighted_sum) {
             float w_val = topkWeightsGm.GetValue(row_idx);
             Muls(y_fp32, y_fp32, w_val, cur_n_len);
         }
@@ -415,7 +417,7 @@ private:
 
         SetAtomicAdd<T>();
 
-        if constexpr (IS_WEIGHTED_SUM) {
+        if (is_weighted_sum) {
             int32_t batch_idx = row_idx / top_k;
             uint64_t y_offset = (uint64_t)batch_idx * (uint64_t)out_dim + (uint64_t)n_offset;
             DataCopy(yGm[y_offset], y_half, cur_n_len);
@@ -461,11 +463,14 @@ private:
     int32_t num_experts = 0;
     int32_t num_groups = 0;
     int32_t total_tokens = 0;
+    
+    // Runtime flags
+    bool is_broadcast_x = false;
+    bool is_weighted_sum = false;
 };
 
 // -----------------------------------------------------------------------------
-// Fused Kernel Implementation (BS <= 4) - low level (no Pipe)
-// Function name unchanged.
+// Fused Kernel Implementation
 // -----------------------------------------------------------------------------
 template<typename T>
 __aicore__ inline void fused_moe_small_bs_impl(
@@ -487,7 +492,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     GM_ADDR w2_in_ptr = (GM_ADDR)((__gm__ uint8_t*)w13_out_ptr + w13_out_size);
 
-    // Phase 0: Zero out (y + w13_out)
+    // Phase 0: Zero out
     {
         uint64_t elems = (y_size + w13_out_size) / sizeof(T);
         KernelZeroOutLL<T> zeroOp;
@@ -497,12 +502,13 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     AscendC::SyncAll();
 
-    // Phase 1: W13 Gemv (Broadcast X)
+    // Phase 1: W13 Gemv (Broadcast X = true, Weighted = false)
     {
-        KernelGroupedGemvW4A16Moe<T, true, false> op_w13;
+        KernelGroupedGemvW4A16Moe<T> op_w13;
         op_w13.Init(x, w13_weight, w13_scales, w13_offsets,
                     expert_ids, w13_out_ptr, nullptr,
-                    total_tokens, hidden_size, inter_size * 2, num_experts, top_k);
+                    total_tokens, hidden_size, inter_size * 2, num_experts, top_k,
+                    true, false);
         op_w13.Process();
     }
 
@@ -517,12 +523,13 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     AscendC::SyncAll();
 
-    // Phase 3: W2 Gemv (Weighted Sum)
+    // Phase 3: W2 Gemv (Broadcast X = false, Weighted = true)
     {
-        KernelGroupedGemvW4A16Moe<T, false, true> op_w2;
+        KernelGroupedGemvW4A16Moe<T> op_w2;
         op_w2.Init(w2_in_ptr, w2_weight, w2_scales, w2_offsets,
                    expert_ids, y, topk_weights,
-                   total_tokens, inter_size, hidden_size, num_experts, top_k);
+                   total_tokens, inter_size, hidden_size, num_experts, top_k,
+                   false, true);
         op_w2.Process();
     }
 }
@@ -560,8 +567,8 @@ extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
     AscendC::InitSocState();
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
 
-    KernelGroupedGemvW4A16Moe<half, false, false> op;
+    KernelGroupedGemvW4A16Moe<half> op;
     op.Init(x, weight, scales, offsets, expert_ids, y, nullptr,
-            total_tokens, in_dim, out_dim, num_experts, top_k);
+            total_tokens, in_dim, out_dim, num_experts, top_k, false, false);
     op.Process();
 }

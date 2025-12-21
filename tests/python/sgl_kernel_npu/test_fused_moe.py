@@ -203,7 +203,7 @@ def run_test_bs1():
     print("=" * 60)
 
     # --- 配置参数 (保持不变) ---
-    BATCH_SIZE = 4
+    BATCH_SIZE = 1
     TOP_K = 8
     NUM_EXPERTS = 128
     HIDDEN_SIZE = 2048
@@ -267,6 +267,11 @@ def run_test_bs1():
     # 3. Custom Fused Kernel
     print(">> [3] Running Custom Fused Kernel (fused_moe_w4a16_small_bs)...")
     # 注意：这里调用的是 Host API 暴露的名称
+    _ = torch.ops.npu.fused_moe_w4a16_small_bs(
+        x, w13_packed, w13_scale, w13_offset, 
+        w2_packed, w2_scale, w2_offset, 
+        topk_ids, topk_weights
+    )
     out_custom = torch.ops.npu.fused_moe_w4a16_small_bs(
         x, w13_packed, w13_scale, w13_offset, 
         w2_packed, w2_scale, w2_offset, 
