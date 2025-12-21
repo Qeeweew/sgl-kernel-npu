@@ -537,6 +537,7 @@ __aicore__ inline void fused_moe_small_bs_impl(
 // -----------------------------------------------------------------------------
 // Extern C Entry Points (names unchanged)
 // -----------------------------------------------------------------------------
+// fused_moe_small_bs_w4a16_fp16_1_mix_aiv$local   11,088 bytes
 extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     GM_ADDR x,
     GM_ADDR w13_weight, GM_ADDR w13_scales, GM_ADDR w13_offsets,
@@ -546,8 +547,9 @@ extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     int32_t batch_size, int32_t hidden_size, int32_t inter_size,
     int32_t num_experts, int32_t top_k)
 {
-    AscendC::InitSocState();
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    ICachePreLoad(6);
+    AscendC::InitSocState();
 
     fused_moe_small_bs_impl<half>(x,
                                  w13_weight, w13_scales, w13_offsets,
@@ -564,8 +566,8 @@ extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
     int32_t total_tokens, int32_t in_dim, int32_t out_dim,
     int32_t num_experts, int32_t top_k)
 {
-    AscendC::InitSocState();
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    AscendC::InitSocState();
 
     KernelGroupedGemvW4A16Moe<half> op;
     op.Init(x, weight, scales, offsets, expert_ids, y, nullptr,
