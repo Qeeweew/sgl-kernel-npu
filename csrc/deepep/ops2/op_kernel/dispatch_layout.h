@@ -98,7 +98,7 @@ public:
         LocalTensor<T> seenRankTensor = seenRankBuf_.AllocTensor<T>();
         LocalTensor<T> sendTokenIdxSmallTensor = sendTokenIdxSmallBuf_.AllocTensor<T>();
         Duplicate<T>(numTokensPerRankTensor, 0, numRanks_);
-        Duplicate<T>(numTokensPerExpertTensor, 0, numExperts_);
+        Duplicate<T>(numTokensPerExpertTensor, 0, numTokensPerExpert32AlignIntLen_ / sizeof(T));
         Duplicate<T>(isTokenInRankTensor, 0, tempTokens_ * numRanks_);
         SyncFunc<AscendC::HardEvent::V_S>();
 
@@ -109,6 +109,9 @@ public:
             SyncFunc<AscendC::HardEvent::V_S>();
             for (int j = 0; j < numTopk_; ++j) {
                 int64_t expert_idx = topkIdxTensor.GetValue(i * numTopk_ + j);
+                if (expert_idx < 0 || expert_idx >= numExperts_) {
+                    continue;
+                }
                 uint32_t per_expert_num = numTokensPerExpertTensor.GetValue(expert_idx) + 1;
                 numTokensPerExpertTensor.SetValue(expert_idx, per_expert_num);
                 int rank_id = expert_idx / experts_per_rank;
@@ -147,6 +150,9 @@ public:
         for (int i = 0; i < tempTokens_; ++i) {
             for (int j = 0; j < numTopk_; ++j) {
                 int64_t expert_idx = topkIdxTensor.GetValue(i * numTopk_ + j);
+                if (expert_idx < 0 || expert_idx >= numExperts_) {
+                    continue;
+                }
                 T valT = numTokensPerExpertTensor(expert_idx);
                 sendTokenIdxSmallTensor(i * numTopk_ + j) = valT;
                 numTokensPerExpertTensor(expert_idx) = valT + 1;

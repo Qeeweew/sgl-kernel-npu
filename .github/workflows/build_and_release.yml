@@ -10,18 +10,31 @@ on:
       - 'main'
     paths:
       - '.github/workflows/build_and_release.yml'
+      - 'config.ini'
+      - 'build.sh'
 
 jobs:
 
   build-and-release:
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: write
-    container:
-      image: quay.io/ascend/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     defaults:
       run:
         shell: bash
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+        hardware: [910b, a3]
+        cann_version: [8.3.rc2, 8.5.0]
+        # Ref: https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: quay.io/ascend/cann:${{ matrix.cann_version }}-${{ matrix.hardware }}-ubuntu22.04-py3.11
 
     steps:
       - name: Checkout repository
@@ -31,9 +44,43 @@ jobs:
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
 
-      - name: Build packages
+      - name: Install dependency
         run: |
-          env -i PATH=${PATH} bash --login scripts/build_and_release.sh
+          bash scripts/npu_ci_install_dependency.sh
+
+      - name: Build SGL-Kernel-NPU
+        run: |
+          env -i PATH=${PATH} bash --login -c "
+            export LD_LIBRARY_PATH=${ASCEND_HOME_PATH}/runtime/lib64/stub:${LD_LIBRARY_PATH} && \
+            ./build.sh -a kernels
+          "
+
+      - name: Build Torch-Memory-Saver
+        run: |
+          env -i PATH=${PATH} bash --login -c "
+            export LD_LIBRARY_PATH=${ASCEND_HOME_PATH}/runtime/lib64/stub:${LD_LIBRARY_PATH} && \
+            ./build.sh -a memory-saver
+          "
+
+      - name: Build DeepEP for 910b
+        if: matrix.hardware == '910b'
+        run: |
+          env -i PATH=${PATH} bash --login -c "
+            export LD_LIBRARY_PATH=${ASCEND_HOME_PATH}/runtime/lib64/stub:${LD_LIBRARY_PATH} && \
+            ./build.sh -a deepep2
+          "
+
+      - name: Build DeepEP for a3
+        if: matrix.hardware == 'a3'
+        run: |
+          env -i PATH=${PATH} bash --login -c "
+            export LD_LIBRARY_PATH=${ASCEND_HOME_PATH}/runtime/lib64/stub:${LD_LIBRARY_PATH} && \
+            ./build.sh -a deepep
+          "
+
+      - name: Pack up packages
+        run: |
+          zip -v "sgl-kernel-npu-${{ github.event.release.tag_name }}-${{ matrix.cann_version }}-${{ matrix.hardware }}-${{ matrix.arch }}.zip" output/*.whl
 
       - name: Upload Release Artifacts
         if: github.event_name != 'pull_request'
@@ -41,4 +88,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          files: output/*.whl
+          files: ./*.zip

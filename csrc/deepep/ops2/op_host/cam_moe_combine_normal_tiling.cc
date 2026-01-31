@@ -29,18 +29,20 @@ namespace {
 class Mc2TilingUtils
 {
 public:
-#define HCCL_BUFFSIZE "HCCL_BUFFSIZE"
     static uint64_t GetMaxWindowSize()
     {
         uint16_t defaultWindowSize = 200;
-        if (getenv(HCCL_BUFFSIZE) == nullptr) {
+        const char *hcclBuffSize = getenv("DEEPEP_HCCL_BUFFSIZE") == nullptr ? "HCCL_BUFFSIZE" : "DEEPEP_HCCL_BUFFSIZE";
+        if (getenv(hcclBuffSize) == nullptr) {
             OP_LOGD("", "Env HCCL_BUFFSIZE don't set");
         } else {
             try {
-                std::string envStr(getenv(HCCL_BUFFSIZE));
+                std::string envStr(getenv(hcclBuffSize));
                 defaultWindowSize = std::stoi(envStr);
-            } catch (...) {
-                OP_LOGE("", "Unknown Exception encountered when parser env HCCL_BUFFERSIZE");
+            } catch (const std::invalid_argument &ia) {
+                OP_LOGE("", "Invalid argument when parsing HCCL_BUFFSIZE: %s", ia.what());
+            } catch (const std::out_of_range &oor) {
+                OP_LOGE("", "Out of range when parsing HCCL_BUFFSIZE: %s", oor.what());
             }
         }
         const uint64_t maxWindowSize = static_cast<uint64_t>(defaultWindowSize) * 1024UL * 1024UL;
@@ -52,7 +54,9 @@ constexpr uint32_t RECV_X_INDEX = 0;
 constexpr uint32_t TOKEN_SRC_INFO_INDEX = 1;
 constexpr uint32_t EP_RECV_COUNTS_INDEX = 2;
 constexpr uint32_t TOPK_WEIGHTS_INDEX = 3;
-constexpr uint32_t TP_RECV_COUNTS_INDEX = 4;
+constexpr uint32_t TOPK_IDX_INDEX = 4;
+constexpr uint32_t TP_RECV_COUNTS_INDEX = 5;
+
 constexpr uint32_t OUTPUT_X_INDEX = 0;
 constexpr uint32_t OUTPUT_SEND_COST_INDEX = 1;
 
@@ -63,7 +67,9 @@ constexpr uint32_t ATTR_GROUP_TP_INDEX = 3;
 constexpr uint32_t ATTR_TP_WORLD_SIZE_INDEX = 4;
 constexpr uint32_t ATTR_TP_RANK_ID_INDEX = 5;
 constexpr uint32_t ATTR_MOE_EXPERT_NUM_INDEX = 6;
-constexpr uint32_t ATTR_GLOBAL_BS_INDEX = 7;
+constexpr uint32_t ATTR_REAL_MAX_BS_INDEX = 7;
+constexpr uint32_t ATTR_MAX_ROUND_INDEX = 8;
+constexpr uint32_t ATTR_PER_ROUND_TOKENS_INDEX = 9;
 
 constexpr uint32_t TWO_DIMS = 2U;
 constexpr uint32_t ONE_DIM = 1U;
@@ -107,13 +113,15 @@ static void PrintTilingDataInfo(const char *nodeName, CamMoeCombineNormalTilingD
     OP_LOGD(nodeName, "expertShardType is %u.", tilingData.camMoeCombineNormalInfo.expertShardType);
     OP_LOGD(nodeName, "moeExpertNum is %u.", tilingData.camMoeCombineNormalInfo.moeExpertNum);
     OP_LOGD(nodeName, "moeExpertPerRankNum is %u.", tilingData.camMoeCombineNormalInfo.moeExpertPerRankNum);
-    OP_LOGD(nodeName, "globalBs is %u.", tilingData.camMoeCombineNormalInfo.globalBs);
+    OP_LOGD(nodeName, "realMaxBs is %u.", tilingData.camMoeCombineNormalInfo.realMaxBs);
     OP_LOGD(nodeName, "bs is %u.", tilingData.camMoeCombineNormalInfo.bs);
     OP_LOGD(nodeName, "k is %u.", tilingData.camMoeCombineNormalInfo.k);
     OP_LOGD(nodeName, "h is %u.", tilingData.camMoeCombineNormalInfo.h);
     OP_LOGD(nodeName, "aivNum is %u.", tilingData.camMoeCombineNormalInfo.aivNum);
     OP_LOGD(nodeName, "totalUbSize is %lu.", tilingData.camMoeCombineNormalInfo.totalUbSize);
     OP_LOGD(nodeName, "totalWinSize is %lu.", tilingData.camMoeCombineNormalInfo.totalWinSize);
+    OP_LOGD(nodeName, "maxRound is %u.", tilingData.camMoeCombineNormalInfo.maxRound);
+    OP_LOGD(nodeName, "perRoundTokens is %u.", tilingData.camMoeCombineNormalInfo.perRoundTokens);
 }
 
 static ge::graphStatus GetAttrAndSetTilingData(gert::TilingContext *context, CamMoeCombineNormalTilingData &tilingData,
@@ -223,6 +231,15 @@ static bool CheckInputTensorDim(gert::TilingContext *context, const char *nodeNa
     OP_LOGD(nodeName, "topkWeights dim0 = %ld", topkWeightsStorageShape->GetStorageShape().GetDim(0));
     OP_LOGD(nodeName, "topkWeights dim1 = %ld", topkWeightsStorageShape->GetStorageShape().GetDim(1));
 
+    const gert::StorageShape *topIdxStorageShape = context->GetInputShape(TOPK_IDX_INDEX);
+    OP_TILING_CHECK(topIdxStorageShape == nullptr, OP_LOGE(nodeName, "topkWeights is null."), return false);
+    OP_TILING_CHECK(topIdxStorageShape->GetStorageShape().GetDimNum() != TWO_DIMS,
+                    OP_LOGE(nodeName, "topkIdx must be 2-dimension, but got %lu dim",
+                            topIdxStorageShape->GetStorageShape().GetDimNum()),
+                    return false);
+    OP_LOGD(nodeName, "topkIdx dim0 = %ld", topIdxStorageShape->GetStorageShape().GetDim(0));
+    OP_LOGD(nodeName, "topkIdx dim1 = %ld", topIdxStorageShape->GetStorageShape().GetDim(1));
+
     return true;
 }
 
@@ -301,6 +318,13 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
     OP_TILING_CHECK((topkWeightsDesc->GetDataType() != ge::DT_FLOAT),
                     OP_LOGE(nodeName, "topkWeights dataType is invalid, dataType should be float, but is "),
                     return false);
+    auto topkIdxDesc = context->GetInputDesc(TOPK_IDX_INDEX);
+    OP_TILING_CHECK(topkIdxDesc == nullptr, OP_LOGE(nodeName, "topkIdxDesc is null."), return false);
+    OP_TILING_CHECK((topkIdxDesc->GetDataType() != ge::DT_INT32),
+                    OP_LOGE(nodeName,
+                            "topkIdxForCombine dataType is invalid,"
+                            " dataType should be int32, but is"),
+                    return false);
     auto xDesc = context->GetOutputDesc(OUTPUT_X_INDEX);
     OP_TILING_CHECK(xDesc == nullptr, OP_LOGE(nodeName, "xDesc is null."), return false);
     OP_TILING_CHECK((xDesc->GetDataType() != recvXDesc->GetDataType()),
@@ -344,6 +368,12 @@ static bool CheckTensorFormat(gert::TilingContext *context, const char *nodeName
     OP_TILING_CHECK(
         static_cast<ge::Format>(ge::GetPrimaryFormat(topkWeightsDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
         OP_LOGE(nodeName, "topkWeightsFormat is invalid"), return false);
+
+    auto topkIdxsDesc = context->GetOptionalInputDesc(TOPK_IDX_INDEX);
+    OP_TILING_CHECK(topkIdxsDesc == nullptr, OP_LOGE(nodeName, "topkIdxsDesc is null."), return false);
+    OP_TILING_CHECK(
+        static_cast<ge::Format>(ge::GetPrimaryFormat(topkIdxsDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
+        OP_LOGE(nodeName, "topkIdxsFormat is invalid"), return false);
 
     auto xDesc = context->GetOutputDesc(OUTPUT_X_INDEX);
     OP_TILING_CHECK(xDesc == nullptr, OP_LOGE(nodeName, "xDesc is null."), return false);
@@ -440,26 +470,28 @@ static bool CheckAttrs(gert::TilingContext *context, CamMoeCombineNormalTilingDa
     // 校验globalBS
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE(nodeName, "attrs is null."), return false);
-    auto globalBsPtr = attrs->GetAttrPointer<int64_t>(ATTR_GLOBAL_BS_INDEX);
-    OP_TILING_CHECK(globalBsPtr == nullptr, OP_LOGE(nodeName, "globalBs is null."), return false);
-    OP_LOGD(nodeName, "CamMoeCombineNormal *globalBsPtr = %ld, bs = %ld, epWorldSize = %u\n", *globalBsPtr,
-            topkWeightsDim0, epWorldSize);
+    auto realMaxBsPtr = attrs->GetAttrPointer<int64_t>(ATTR_REAL_MAX_BS_INDEX);
+    OP_TILING_CHECK(realMaxBsPtr == nullptr, OP_LOGE(nodeName, "realMaxBs is null."), return false);
+    OP_LOGD(nodeName, "CamMoeCombineNormal *realMaxBsPtr = %ld, bs = %ld\n", *realMaxBsPtr, topkWeightsDim0);
 
     OP_TILING_CHECK(
-        (*globalBsPtr != 0) && ((*globalBsPtr < static_cast<int64_t>(epWorldSize) * topkWeightsDim0) ||
-                                ((*globalBsPtr) % (static_cast<int64_t>(epWorldSize)) != 0)),
+        (*realMaxBsPtr != 0) && (*realMaxBsPtr < topkWeightsDim0),
         OP_LOGE(nodeName,
-                "globalBS is invalid, only "
-                "support 0 or maxBs(maxBs is the largest bs on all ranks) * epWorldSize, but got globalBS=%ld, "
-                "bs=%ld, epWorldSize=%u.",
-                *globalBsPtr, topkWeightsDim0, epWorldSize),
+                "realMaxBs is invalid, only support 0 or value greater than or equal to the BS of all ranks."
+                "but got realMaxBs=%ld, bs=%ld",
+                *realMaxBsPtr, topkWeightsDim0),
         return false);
 
-    tilingData.camMoeCombineNormalInfo.globalBs = static_cast<uint32_t>(*globalBsPtr);
-    if (*globalBsPtr == 0) {
-        tilingData.camMoeCombineNormalInfo.globalBs = static_cast<uint32_t>(topkWeightsDim0) * epWorldSize;
+    tilingData.camMoeCombineNormalInfo.realMaxBs = static_cast<uint32_t>(*realMaxBsPtr);
+    if (*realMaxBsPtr == 0) {
+        tilingData.camMoeCombineNormalInfo.realMaxBs = static_cast<uint32_t>(topkWeightsDim0);
     }
-
+    auto maxRoundPtr = attrs->GetAttrPointer<int64_t>(ATTR_MAX_ROUND_INDEX);
+    OP_TILING_CHECK(maxRoundPtr == nullptr, OP_LOGE(nodeName, "maxRound is null."), return false);
+    auto perRoundTokensPtr = attrs->GetAttrPointer<int64_t>(ATTR_PER_ROUND_TOKENS_INDEX);
+    OP_TILING_CHECK(perRoundTokensPtr == nullptr, OP_LOGE(nodeName, "perRoundTokens is null."), return false);
+    tilingData.camMoeCombineNormalInfo.maxRound = static_cast<uint32_t>(*maxRoundPtr);
+    tilingData.camMoeCombineNormalInfo.perRoundTokens = static_cast<uint32_t>(*perRoundTokensPtr);
     return true;
 }
 
@@ -544,19 +576,20 @@ static ge::graphStatus CamMoeCombineNormalA3TilingFuncImpl(gert::TilingContext *
     uint64_t h = static_cast<uint64_t>(tilingData->camMoeCombineNormalInfo.h);
     uint64_t epWorldSize = static_cast<uint64_t>(tilingData->camMoeCombineNormalInfo.epWorldSize);
     uint64_t k = static_cast<uint64_t>(tilingData->camMoeCombineNormalInfo.k);
-    uint64_t maxBs = static_cast<uint64_t>(tilingData->camMoeCombineNormalInfo.globalBs) / epWorldSize;
+    uint64_t perRoundTokens = tilingData->camMoeCombineNormalInfo.perRoundTokens;
     // combine数据区 token首地址对齐512
     uint64_t tokenNeedSizeCombine = ((h * MAX_OUT_DTYPE_SIZE + WIN_ADDR_ALIGN - 1UL) / WIN_ADDR_ALIGN) * WIN_ADDR_ALIGN;
     uint64_t actualSize =
-        (maxBs * k * tokenNeedSizeCombine + COMBINE_STATE_WIN_OFFSET + NOTIFY_DISPATCH_WIN_OFFSET) * DOUBLE_DATA_BUFFER;
+        (perRoundTokens * k * tokenNeedSizeCombine + COMBINE_STATE_WIN_OFFSET + NOTIFY_DISPATCH_WIN_OFFSET) *
+        DOUBLE_DATA_BUFFER;
     OP_TILING_CHECK(
         (actualSize > maxWindowSize),
         OP_LOGE(nodeName,
-                "HCCL_BUFFSIZE is too SMALL, maxBs = %lu, h = %lu, epWorldSize = %lu, localMoeExpertNum = %u,"
+                "HCCL_BUFFSIZE is too SMALL, perRoundTokens = %lu, h = %lu, epWorldSize = %lu, localMoeExpertNum = %u,"
                 " tokenNeedSizeCombine = %lu, k = %lu, NEEDED_HCCL_BUFFSIZE("
-                "((maxBs * k * tokenNeedSizeCombine)) + 3MB + 204MB) * 2) = %luMB, "
+                "((perRoundTokens * k * tokenNeedSizeCombine)) + 8MB + 102MB) * 2) = %luMB, "
                 "HCCL_BUFFSIZE=%luMB.",
-                maxBs, h, epWorldSize, localMoeExpertNum, tokenNeedSizeCombine, k, actualSize / MB_SIZE + 1UL,
+                perRoundTokens, h, epWorldSize, localMoeExpertNum, tokenNeedSizeCombine, k, actualSize / MB_SIZE + 1UL,
                 maxWindowSize / MB_SIZE),
         return ge::GRAPH_FAILED);
     tilingData->camMoeCombineNormalInfo.totalWinSize = maxWindowSize;

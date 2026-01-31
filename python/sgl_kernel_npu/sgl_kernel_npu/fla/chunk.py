@@ -1,10 +1,12 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+import typing
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from sgl_kernel_npu.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_npu as chunk_gated_delta_rule_fwd_h,
 )
@@ -15,8 +17,31 @@ from sgl_kernel_npu.fla.chunk_scaled_dot_kkt import (
 from sgl_kernel_npu.fla.cumsum import chunk_local_cumsum
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu as solve_tril
-from sgl_kernel_npu.fla.utils import SUPPRESS_LEVEL
+from sgl_kernel_npu.fla.utils import SUPPRESS_LEVEL, input_guard
 from sgl_kernel_npu.fla.wy_fast import recompute_w_u_fwd_npu as recompute_w_u_fwd
+
+
+def fast_inv_tril(A: torch.Tensor):
+    dtype = A.dtype
+    assert A.shape[-2] == A.shape[-1]
+    chunk_size = A.shape[-1]
+    identity = torch.eye(chunk_size, dtype=torch.float32, device=A.device)
+    A_inv = torch.ops.npu.triangular_inverse(identity - A.to(torch.float32))
+    return A_inv.to(dtype)
+
+
+def inv_tril_inplace(A: torch.Tensor):
+    """
+    Returns the "matrix inverse" of the last two dimensions of A that must be a strict lower-triangular matrix.
+    The algorithm is somewhat "in-place", in the sense that it does not explicitly form a full matrix for the inverse.
+    """
+    assert A.shape[-2] == A.shape[-1]
+    chunk_size = A.shape[-1]
+    for i in range(1, chunk_size):
+        row = A[..., i, :i].clone()
+        sub = A[..., :i, :i].clone()
+        A[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    return A + torch.eye(chunk_size, dtype=A.dtype, device=A.device)
 
 
 def chunk_gated_delta_rule_native(
@@ -29,6 +54,7 @@ def chunk_gated_delta_rule_native(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    tri_inv_fn: typing.Callable = inv_tril_inplace,
 ):
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
@@ -68,11 +94,7 @@ def chunk_gated_delta_rule_native(
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    attn = tri_inv_fn(attn)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
@@ -112,7 +134,7 @@ def chunk_gated_delta_rule_native(
     return core_attn_out, last_recurrent_state
 
 
-def chunk_gated_delta_rule_npu(
+def chunk_gated_delta_rule_npu_native(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -218,13 +240,14 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        return g, o, A, final_state, None, h, None
     elif SUPPRESS_LEVEL >= 3:
         return g, o, A, final_state, w, h, v_new
 
 
+@input_guard
 @torch.compiler.disable
-def chunk_gated_delta_rule(
+def chunk_gated_delta_rule_npu(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -232,7 +255,7 @@ def chunk_gated_delta_rule(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
+    output_final_state: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
@@ -300,7 +323,6 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
-    from einops import rearrange
 
     assert q.dtype == k.dtype == v.dtype
     assert (
@@ -343,10 +365,12 @@ def chunk_gated_delta_rule(
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
 
-    _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
+    _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
         q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens
     )
     o = o.to(q.dtype)
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
-    return o, final_state
+    act_sq = cu_seqlens[-1].cpu().item()
+    o = o[:, :act_sq, :, :]
+    return o, final_state, h
