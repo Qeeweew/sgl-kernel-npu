@@ -11,10 +11,8 @@ ONLY_BUILD_DEEPEP_KERNELs_MODULE="OFF"
 ONLY_BUILD_MEMORY_SAVER_MODULE="OFF"
 
 DEBUG_MODE="OFF"
-CLEAN_BUILD="OFF"  # 新增：默认不清理构建目录，开启增量编译
 
-# 修改 getopts 增加 'c' 选项
-while getopts ":a:hdc" opt; do
+while getopts ":a:hd" opt; do
     case ${opt} in
         a )
             BUILD_DEEPEP_MODULE="OFF"
@@ -54,12 +52,8 @@ while getopts ":a:hdc" opt; do
         d )
             DEBUG_MODE="ON"
             ;;
-        c ) # 新增：清理构建目录的选项
-            CLEAN_BUILD="ON"
-            ;;
         h )
-            echo "Use './build.sh' build all modules (Incremental by default)."
-            echo "Use './build.sh -c' to FORCE CLEAN build (delete build directories)."
+            echo "Use './build.sh' build all modules."
             echo "Use './build.sh -a <target>' to build specific parts of the project."
             echo "    <target> can be:"
             echo "    deepep            Only build deep_ep."
@@ -87,11 +81,11 @@ shift $((OPTIND -1))
 
 export DEBUG_MODE=$DEBUG_MODE
 
-SOC_VERSION="${1:-Ascend910B3}"
+SOC_VERSION="${1:-Ascend910_9382}"
 
 
 ### Get Current CANN Toolkit Installation Path
-_CANN_TOOLKIT_INSTALL_PATH=$(cat /etc/Ascend/ascend_cann_install.info | grep "Toolkit_InstallPath" | awk -F'=' '{print $2}')
+_CANN_TOOLKIT_INSTALL_PATH=/mnt/nvme0n1/home/xwj/Ascend/cann-8.5.0 #$(cat /etc/Ascend/ascend_cann_install.info | grep "Toolkit_InstallPath" | awk -F'=' '{print $2}')
 source ${_CANN_TOOLKIT_INSTALL_PATH}/set_env.sh
 echo -e "\e[1;32mDetected CANN Toolkit Installation Path: ${_CANN_TOOLKIT_INSTALL_PATH}\e[0m"
 echo -e "\e[1;33mDouble Checking Environment Variables:\e[0m"
@@ -114,19 +108,12 @@ function build_kernels()
     if [[ "$ONLY_BUILD_DEEPEP_KERNELs_MODULE" == "ON" ]]; then return 0; fi
     if [[ "$ONLY_BUILD_MEMORY_SAVER_MODULE" == "ON" ]]; then return 0; fi
 
-    # 1. 动态获取最大核心数，解决“慢”的问题
-    MAX_JOBS=$(nproc 2>/dev/null || echo 16)
-    echo "[INFO] Using ${MAX_JOBS} parallel jobs for Make."
-
     CMAKE_DIR=""
     BUILD_DIR="build"
 
     cd "$CMAKE_DIR" || exit
 
-    if [[ "$CLEAN_BUILD" == "ON" ]]; then
-        echo "[INFO] Cleaning build directory for kernels..."
-        rm -rf $BUILD_DIR
-    fi
+    rm -rf $BUILD_DIR
     mkdir -p $BUILD_DIR
 
     cmake $COMPILE_OPTIONS \
@@ -140,17 +127,6 @@ function build_kernels()
     -S .
 
     cmake --build "$BUILD_DIR" --target install -j 16
-    cmake $COMPILE_OPTIONS \
-        -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
-        -DASCEND_HOME_PATH=$ASCEND_HOME_PATH \
-        -DSOC_VERSION=$SOC_VERSION \
-        -DBUILD_DEEPEP_MODULE=$BUILD_DEEPEP_MODULE \
-        -DBUILD_KERNELS_MODULE=$BUILD_KERNELS_MODULE \
-        -B "$BUILD_DIR" \
-        -S .
-    
-    # 3. 使用所有核心进行编译
-    cmake --build "$BUILD_DIR" -j"${MAX_JOBS}" --target install
     cd -
 }
 
@@ -168,8 +144,6 @@ function build_deepep_kernels()
 
     cd "$KERNEL_DIR" || exit
 
-    # 注意：deepep 的内部 build.sh 可能自己含有清理逻辑。
-    # 如果你也想让 deepep 增量编译，可能需要检查并修改 $KERNEL_DIR/build.sh
     chmod +x build.sh
     chmod +x cmake/util/gen_ops_filter.sh
     ./build.sh
@@ -192,8 +166,6 @@ function build_memory_saver()
     if [[ "$BUILD_MEMORY_SAVER_MODULE" != "ON" ]]; then return 0; fi
     echo "[memory_saver] Building torch_memory_saver via setup.py"
     cd contrib/torch_memory_saver/python || exit
-    # Python setup.py clean 比较快，通常建议保留以防止 Wheel 包污染
-    # 如果想极致速度，可以注释掉下面两行，但一般不推荐
     rm -rf "$CURRENT_DIR"/contrib/torch_memory_saver/python/build
     rm -rf "$CURRENT_DIR"/contrib/torch_memory_saver/python/dist
     python3 setup.py clean --all

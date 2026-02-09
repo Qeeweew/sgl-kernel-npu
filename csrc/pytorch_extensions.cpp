@@ -91,13 +91,13 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "gemv_w4a16(Tensor x, Tensor weight, Tensor scales, Tensor offsets) "
         "-> Tensor");
 
-    m.def(
-        "sgemmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! lora_ranks,"
-        "              Tensor! sliceOffsets, Tensor! y) -> Tensor");
+    // m.def(
+    //     "sgemmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! lora_ranks,"
+    //     "              Tensor! sliceOffsets, Tensor! y) -> Tensor");
 
-    m.def(
-        "sgemmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! lora_ranks,"
-        "              Tensor! lora_scales, Tensor! y) -> ()");
+    // m.def(
+    //     "sgemmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! lora_ranks,"
+    //     "              Tensor! lora_scales, Tensor! y) -> ()");
 
 #ifdef BUILD_CATLASS_MODULE
     m.def("catlass_matmul_basic(Tensor tensor_a, Tensor tensor_b, Tensor(a!) tensor_c, str? format_mode=None) -> ()");
@@ -146,9 +146,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("gemv_w4a16", TORCH_FN(sglang::npu_kernel::gemv_w4a16));
 
-    m.impl("sgemmv_expand", TORCH_FN(sglang::npu_kernel::sgemmv_expand));
+    // m.impl("sgemmv_expand", TORCH_FN(sglang::npu_kernel::sgemmv_expand));
 
-    m.impl("sgemmv_shrink", TORCH_FN(sglang::npu_kernel::sgemmv_shrink));
+    // m.impl("sgemmv_shrink", TORCH_FN(sglang::npu_kernel::sgemmv_shrink));
 
 #ifdef BUILD_CATLASS_MODULE
     m.impl("catlass_matmul_basic", TORCH_FN(sglang::npu_kernel::catlass_matmul_basic));
