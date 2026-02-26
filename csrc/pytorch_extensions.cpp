@@ -98,6 +98,13 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "int? sparse_count=None, int? sparse_mode=None) -> Tensor");
 
     m.def("triangular_inverse(Tensor x) -> Tensor");
+
+    m.def(
+        "grouped_gemv_w4a16_moe(Tensor x_in, Tensor weight, Tensor scales, Tensor expert_ids) -> Tensor");
+
+    m.def(
+        "fused_moe_w4a16_small_bs(Tensor x_in, Tensor w13_weight, Tensor w13_scales, "
+        "Tensor w2_weight, Tensor w2_scales, Tensor expert_ids, Tensor topk_weights) -> Tensor");
 }
 }  // namespace
 
@@ -141,5 +148,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("lightning_indexer", TORCH_FN(sglang::npu_kernel::lightning_indexer));
 
     m.impl("triangular_inverse", TORCH_FN(sglang::npu_kernel::tri_inv_col_sweep));
+
+    m.impl("grouped_gemv_w4a16_moe", TORCH_FN(sglang::npu_kernel::grouped_gemv_w4a16_moe));
+
+    m.impl("fused_moe_w4a16_small_bs", TORCH_FN(sglang::npu_kernel::fused_moe_w4a16_small_bs));
 }
 }  // namespace
