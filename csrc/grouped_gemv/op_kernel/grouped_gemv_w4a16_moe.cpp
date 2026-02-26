@@ -5,6 +5,15 @@
 using namespace AscendC;
 
 // -----------------------------------------------------------------------------
+// Type Traits for BFloat16 detection
+// -----------------------------------------------------------------------------
+template<typename T>
+struct IsBFloat16 : std::false_type {};
+
+template<>
+struct IsBFloat16<bfloat16_t> : std::true_type {};
+
+// -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 constexpr int32_t BLOCK_SIZE       = 128; // 一次处理的计算块大小
@@ -313,7 +322,7 @@ private:
                                         int32_t x_offset_idx,
                                         int32_t tile_n,
                                         int32_t tile_n_packed,
-                                        LocalTensor<T>& x_full_half,
+                                        LocalTensor<half>& x_full_half,
                                         LocalTensor<half>& current_group_acc) {
         LocalTensor<uint64_t> x_u64 = x_full_half.template ReinterpretCast<uint64_t>();
 
@@ -348,6 +357,18 @@ private:
         SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
         WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
 
+        // 如果是 BF16，需要转换为 half 供后续计算使用
+        // 使用 y_fp32 的前 64 个 float (256 bytes) 作为中转，可以容纳 128 个 float
+        // 转换流程：bf16 -> fp32 -> fp16
+        if constexpr (IsBFloat16<T>::value) {
+            LocalTensor<float> f_tmp = w_half.template ReinterpretCast<float>();
+            LocalTensor<half> x_half = x_local.template ReinterpretCast<half>();
+            // bf16 -> fp32
+            Cast(f_tmp, x_local, RoundMode::CAST_NONE, BLOCK_SIZE);
+            // fp32 -> fp16 (原地覆盖 x_local)
+            Cast(x_half, f_tmp, RoundMode::CAST_ROUND, BLOCK_SIZE);
+        }
+
         PrefetchW(expert_id, b_idx, 0, n_offset, cur_n_len, 0);
         SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
 
@@ -374,10 +395,12 @@ private:
             }
 
             // 计算该 32 行该放入哪个 group_acc
-            int step = k_inner / COMPUTE_ROWS; 
+            int step = k_inner / COMPUTE_ROWS;
             LocalTensor<half> current_acc = group_acc[step * TILE_N];
 
-            ComputeChunk(w_local[ping], k_inner, cur_n_len, cur_n_packed, x_local, current_acc);
+            // x_local 现在已经是 half 类型（如果是 bf16 已经转换过了）
+            LocalTensor<half> x_input = x_local.template ReinterpretCast<half>();
+            ComputeChunk(w_local[ping], k_inner, cur_n_len, cur_n_packed, x_input, current_acc);
 
             if (k_inner + COMPUTE_ROWS < BLOCK_SIZE) {
                 SetFlag<HardEvent::V_MTE2>(EID_V_MTE2);
@@ -389,10 +412,31 @@ private:
 
         // 对称量化，省去了 zero-point offset 补偿
         // 遍历 4 个分组，将 4 个 FP16 Group累加器 分别乘上对应的 Scale 后加入全局 Float 累加器中
-        for (int i = 0; i < GROUPS_PER_BLOCK; ++i) {
-            LocalTensor<half> current_acc = group_acc[i * TILE_N];
-            LocalTensor<T> current_scale = s_local[i * TILE_N];
-            MulAddDst(global_acc, current_acc, current_scale, cur_n_len);
+        if constexpr (IsBFloat16<T>::value) {
+            // 对于 BF16，需要复用 w_half 作为 fp32 workspace
+            // w_half 大小为 GROUP_TILE * TILE_N = 8 * 2048 个 half
+            // 作为 fp32 可以容纳 8192 个 float，足够覆盖 cur_n_len (<= 2048)
+            LocalTensor<float> f_acc = w_half.template ReinterpretCast<float>();
+            LocalTensor<float> f_scale = f_acc[TILE_N];
+
+            for (int i = 0; i < GROUPS_PER_BLOCK; ++i) {
+                LocalTensor<half> current_acc = group_acc[i * TILE_N];
+                LocalTensor<T> current_scale = s_local[i * TILE_N];
+
+                // current_acc (half) -> f_acc (float)
+                Cast(f_acc, current_acc, RoundMode::CAST_NONE, cur_n_len);
+                // current_scale (bfloat16) -> f_scale (float)
+                Cast(f_scale, current_scale, RoundMode::CAST_NONE, cur_n_len);
+                // f_acc * f_scale -> f_acc
+                MulAddDst(global_acc, f_acc, f_scale, cur_n_len);
+            }
+        } else {
+            // FP16 使用原来的 MulAddDst
+            for (int i = 0; i < GROUPS_PER_BLOCK; ++i) {
+                LocalTensor<half> current_acc = group_acc[i * TILE_N];
+                LocalTensor<T> current_scale = s_local[i * TILE_N];
+                MulAddDst(global_acc, current_acc, current_scale, cur_n_len);
+            }
         }
     }
 
@@ -484,8 +528,8 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     // Phase 0: Zero out
     {
-        uint64_t elems = (y_size + w13_out_size) / sizeof(T);
-        KernelZeroOutLL<T> zeroOp;
+        uint64_t elems = (y_size + w13_out_size) / sizeof(int32_t);
+        KernelZeroOutLL<int32_t> zeroOp;
         zeroOp.Init(workspace, elems);
         zeroOp.Process();
     }
@@ -525,8 +569,29 @@ __aicore__ inline void fused_moe_small_bs_impl(
 }
 
 // -----------------------------------------------------------------------------
-// Extern C Entry Points 
+// Extern C Entry Points
 // -----------------------------------------------------------------------------
+extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_bf16(
+    GM_ADDR x,
+    GM_ADDR w13_weight, GM_ADDR w13_scales,
+    GM_ADDR w2_weight,  GM_ADDR w2_scales,
+    GM_ADDR expert_ids, GM_ADDR topk_weights,
+    GM_ADDR workspace,
+    int32_t batch_size, int32_t hidden_size, int32_t inter_size,
+    int32_t num_experts, int32_t top_k)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    AscendC::InitSocState();
+
+    fused_moe_small_bs_impl<bfloat16_t>(x,
+                                        w13_weight, w13_scales,
+                                        w2_weight,  w2_scales,
+                                        expert_ids, topk_weights,
+                                        workspace,
+                                        batch_size, hidden_size, inter_size,
+                                        num_experts, top_k);
+}
+
 extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     GM_ADDR x,
     GM_ADDR w13_weight, GM_ADDR w13_scales,
@@ -546,6 +611,21 @@ extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
                                  workspace,
                                  batch_size, hidden_size, inter_size,
                                  num_experts, top_k);
+}
+
+extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_bf16(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales,
+    GM_ADDR expert_ids, GM_ADDR y,
+    int32_t total_tokens, int32_t in_dim, int32_t out_dim,
+    int32_t num_experts, int32_t top_k)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    AscendC::InitSocState();
+
+    KernelGroupedGemvW4A16Moe<bfloat16_t> op;
+    op.Init(x, weight, scales, expert_ids, y, nullptr,
+            total_tokens, in_dim, out_dim, num_experts, top_k, false, false);
+    op.Process();
 }
 
 extern "C" __global__ __aicore__ void grouped_gemv_w4a16_moe_fp16(
