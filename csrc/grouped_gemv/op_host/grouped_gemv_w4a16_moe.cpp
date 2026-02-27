@@ -136,28 +136,20 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
     int32_t out_dim = w2_weight.size(2) * 8;
     TORCH_CHECK(in_dim == out_dim, "in_dim and out_dim must be equal for MoE");
 
-    // Workspace Calculation
-    // W13 Output: [TotalTokens, 2 * InterDim]
-    // SwiGLU Output: [TotalTokens, InterDim]
-    int64_t w13_out_elems = (int64_t)total_tokens * inter_dim * 2;
+    // Workspace Calculation (in T elements)
+    // W13 Output (FP32): [TotalTokens, 2 * InterDim] -> 2x space
+    // SwiGLU Output (T): [TotalTokens, InterDim]
+    // W2 Output (FP32): [BatchSize, OutDim] -> 2x space
+    int64_t w13_out_elems = (int64_t)total_tokens * inter_dim * 2 * 2;  // *2 for FP32
     int64_t swiglu_out_elems = (int64_t)total_tokens * inter_dim;
-    int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems;
-    int64_t y_elems = (int64_t)batch_size * out_dim;
-    int64_t total_elems = total_workspace_elems + y_elems;
-    at::Tensor buffer = at::empty({total_elems}, x_in.options());
+    int64_t w2_out_elems = (int64_t)batch_size * out_dim * 2;  // *2 for FP32
+    int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems + w2_out_elems;
 
-    at::Tensor y = buffer.narrow(
-        0,
-        0,
-        y_elems
-    ).view({batch_size, out_dim});
+    // y is the final output tensor
+    at::Tensor y = at::zeros({batch_size, out_dim}, x_in.options());
 
-    at::Tensor workspace = buffer.narrow(
-        0,                    // dim
-        y_elems,              // start
-        total_workspace_elems // length
-    );
-
+    // workspace for intermediate results (mix of FP32 and T)
+    at::Tensor workspace = at::empty({total_workspace_elems}, x_in.options());
 
     // 2. Kernel Launch
     auto acl_stream = c10_npu::getCurrentNPUStream();
@@ -174,7 +166,8 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
             const_cast<void *>(w2_scales.data_ptr()),
             const_cast<void *>(expert_ids_flat.data_ptr()),
             const_cast<void *>(topk_weights_flat.data_ptr()),
-            const_cast<void *>(buffer.data_ptr()),
+            y.data_ptr(),
+            workspace.data_ptr(),
             batch_size, in_dim, inter_dim, num_experts, top_k
         );
     } else if (x_in.dtype() == at::kBFloat16) {
@@ -187,7 +180,8 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
             const_cast<void *>(w2_scales.data_ptr()),
             const_cast<void *>(expert_ids_flat.data_ptr()),
             const_cast<void *>(topk_weights_flat.data_ptr()),
-            const_cast<void *>(buffer.data_ptr()),
+            y.data_ptr(),
+            workspace.data_ptr(),
             batch_size, in_dim, inter_dim, num_experts, top_k
         );
     } else {

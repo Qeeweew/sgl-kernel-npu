@@ -71,6 +71,7 @@ private:
 // -----------------------------------------------------------------------------
 // Kernel SwiGLU (Low-level, NO double-buffer; simple)
 // Layout: [Gate | Value] split at inter_dim
+// Input: FP32, Output: T
 // -----------------------------------------------------------------------------
 template<typename T, uint32_t TILE_LEN = 1024>
 class KernelSwiGLU {
@@ -78,21 +79,19 @@ public:
     __aicore__ inline KernelSwiGLU() {}
 
     __aicore__ inline void Init(GM_ADDR input, GM_ADDR output, int32_t total_rows, int32_t inter_dim) {
-        inputGm.SetGlobalBuffer((__gm__ T*)input);
+        inputGm.SetGlobalBuffer((__gm__ float*)input);
         outputGm.SetGlobalBuffer((__gm__ T*)output);
         this->total_rows = total_rows;
         this->inter_dim  = inter_dim;
 
         uint32_t addr = 0;
-        t_in  = LocalTensor<T>(TPosition::VECIN,  addr, 2 * TILE_LEN);
-        addr += (uint32_t)(2 * TILE_LEN * sizeof(T));
-        t_out = LocalTensor<T>(TPosition::VECOUT, addr, TILE_LEN);
-        addr += (uint32_t)(TILE_LEN * sizeof(T));
-
         f_in  = LocalTensor<float>(TPosition::VECCALC, addr, 2 * TILE_LEN);
         addr += (uint32_t)(2 * TILE_LEN * sizeof(float));
         f_out = LocalTensor<float>(TPosition::VECCALC, addr, TILE_LEN);
         addr += (uint32_t)(TILE_LEN * sizeof(float));
+
+        t_out = LocalTensor<T>(TPosition::VECOUT, addr, TILE_LEN);
+        addr += (uint32_t)(TILE_LEN * sizeof(T));
     }
 
     __aicore__ inline void Process() {
@@ -119,17 +118,17 @@ private:
                 WaitFlag<HardEvent::MTE3_V>(EID_MTE3_V);     // previous store done before overwriting t_out
             }
 
+            // Copy FP32 input directly
             DataCopyParams params;
             params.blockCount = 2;
-            params.blockLen   = (uint16_t)(len * (int32_t)sizeof(T) / 32);
-            params.srcStride  = (uint16_t)((inter_dim - len) * (int32_t)sizeof(T) / 32);
+            params.blockLen   = (uint16_t)(len * (int32_t)sizeof(float) / 32);
+            params.srcStride  = (uint16_t)((inter_dim - len) * (int32_t)sizeof(float) / 32);
             params.dstStride  = 0;
 
-            DataCopy(t_in, inputGm[in_base + (uint64_t)i], params);
+            DataCopy(f_in, inputGm[in_base + (uint64_t)i], params);
             SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
             WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
 
-            Cast(f_in, t_in, RoundMode::CAST_NONE, 2 * len);
             Silu(f_out, f_in, len);
             Mul(f_out, f_out, f_in[len], len);
             Cast(t_out, f_out, RoundMode::CAST_ROUND, len);
@@ -156,17 +155,17 @@ private:
     }
 
 private:
-    GlobalTensor<T> inputGm;
+    GlobalTensor<float> inputGm;
     GlobalTensor<T> outputGm;
 
-    LocalTensor<T>     t_in, t_out;
     LocalTensor<float> f_in, f_out;
+    LocalTensor<T>     t_out;
 
     int32_t total_rows = 0;
     int32_t inter_dim  = 0;
 };
 
-template<typename T>
+template<typename T, typename OutputT = T>
 class KernelGroupedGemvW4A16Moe {
 public:
     __aicore__ inline KernelGroupedGemvW4A16Moe() {}
@@ -182,11 +181,10 @@ public:
         this->out_dim = out_dim;
         this->out_dim_packed = out_dim / PACK_RATIO;
         this->num_experts = num_experts;
-        
         // Block 是数据加载单元，Group 是 Scale 单元
         this->num_blocks = in_dim / BLOCK_SIZE;
-        this->total_groups = in_dim / GROUP_SIZE; 
-        
+        this->total_groups = in_dim / GROUP_SIZE;
+
         this->is_broadcast_x = is_broadcast_x;
         this->is_weighted_sum = is_weighted_sum;
 
@@ -194,7 +192,7 @@ public:
         weightGm.SetGlobalBuffer((__gm__ int32_t*)weight);
         scalesGm.SetGlobalBuffer((__gm__ T*)scales);
         expertIdsGm.SetGlobalBuffer((__gm__ int32_t*)expert_ids);
-        yGm.SetGlobalBuffer((__gm__ T*)y);
+        yGm.SetGlobalBuffer((__gm__ OutputT*)y);
 
         if (is_weighted_sum) {
             topkWeightsGm.SetGlobalBuffer((__gm__ float*)topk_weights);
@@ -448,24 +446,41 @@ private:
             Muls(y_fp32, y_fp32, w_val, cur_n_len);
         }
 
-        LocalTensor<T> y_half = y_fp32.template ReinterpretCast<T>();
-        Cast(y_half, y_fp32, RoundMode::CAST_ROUND, cur_n_len);
-
         SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
         WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
 
-        SetAtomicAdd<T>();
+        if constexpr (std::is_same_v<OutputT, float>) {
+            // FP32 output: copy directly without cast
+            SetAtomicAdd<float>();
 
-        if (is_weighted_sum) {
-            int32_t batch_idx = row_idx / top_k;
-            uint64_t y_offset = (uint64_t)batch_idx * (uint64_t)out_dim + (uint64_t)n_offset;
-            DataCopy(yGm[y_offset], y_half, cur_n_len);
+            if (is_weighted_sum) {
+                int32_t batch_idx = row_idx / top_k;
+                uint64_t y_offset = (uint64_t)batch_idx * (uint64_t)out_dim + (uint64_t)n_offset;
+                DataCopy(yGm[y_offset], y_fp32, cur_n_len);
+            } else {
+                uint64_t y_offset = (uint64_t)row_idx * (uint64_t)out_dim + (uint64_t)n_offset;
+                DataCopy(yGm[y_offset], y_fp32, cur_n_len);
+            }
+
+            SetAtomicNone();
         } else {
-            uint64_t y_offset = (uint64_t)row_idx * (uint64_t)out_dim + (uint64_t)n_offset;
-            DataCopy(yGm[y_offset], y_half, cur_n_len);
-        }
+            // T output: cast from FP32 to T
+            LocalTensor<T> y_half = y_fp32.template ReinterpretCast<T>();
+            Cast(y_half, y_fp32, RoundMode::CAST_ROUND, cur_n_len);
 
-        SetAtomicNone();
+            SetAtomicAdd<T>();
+
+            if (is_weighted_sum) {
+                int32_t batch_idx = row_idx / top_k;
+                uint64_t y_offset = (uint64_t)batch_idx * (uint64_t)out_dim + (uint64_t)n_offset;
+                DataCopy(yGm[y_offset], y_half, cur_n_len);
+            } else {
+                uint64_t y_offset = (uint64_t)row_idx * (uint64_t)out_dim + (uint64_t)n_offset;
+                DataCopy(yGm[y_offset], y_half, cur_n_len);
+            }
+
+            SetAtomicNone();
+        }
 
         SetFlag<HardEvent::MTE3_V>(EID_MTE3_V);
         WaitFlag<HardEvent::MTE3_V>(EID_MTE3_V);
@@ -478,7 +493,7 @@ private:
     GlobalTensor<int32_t> weightGm;
     GlobalTensor<T>       scalesGm;
     GlobalTensor<int32_t> expertIdsGm;
-    GlobalTensor<T>       yGm;
+    GlobalTensor<OutputT> yGm;
 
     // UB
     LocalTensor<T>        x_local;
@@ -504,6 +519,59 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+// Kernel Cast FP32 to T (for final output conversion)
+// -----------------------------------------------------------------------------
+template<typename T, uint32_t TILE_LEN = 2048>
+class KernelCastFP32ToT {
+public:
+    __aicore__ inline KernelCastFP32ToT() {}
+
+    __aicore__ inline void Init(GM_ADDR input, GM_ADDR output, int32_t total_elems) {
+        inputGm.SetGlobalBuffer((__gm__ float*)input);
+        outputGm.SetGlobalBuffer((__gm__ T*)output);
+        this->total_elems = total_elems;
+
+        uint32_t addr = 0;
+        f_local = LocalTensor<float>(TPosition::VECIN, addr, TILE_LEN);
+        addr += (uint32_t)(TILE_LEN * sizeof(float));
+        t_local = LocalTensor<T>(TPosition::VECOUT, addr, TILE_LEN);
+        addr += (uint32_t)(TILE_LEN * sizeof(T));
+    }
+
+    __aicore__ inline void Process() {
+        int32_t core_idx = GetBlockIdx();
+        int32_t core_num = GetBlockNum();
+
+        for (int64_t base = (int64_t)core_idx * TILE_LEN; base < total_elems; base += (int64_t)core_num * TILE_LEN) {
+            int32_t len = (int32_t)((total_elems - base < (int64_t)TILE_LEN) ? (total_elems - base) : TILE_LEN);
+
+            DataCopy(f_local, inputGm[base], len);
+            SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+            WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+
+            Cast(t_local, f_local, RoundMode::CAST_ROUND, len);
+
+            SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+            WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+
+            DataCopy(outputGm[base], t_local, len);
+
+            SetFlag<HardEvent::MTE3_V>(EID_MTE3_V);
+            WaitFlag<HardEvent::MTE3_V>(EID_MTE3_V);
+        }
+    }
+
+private:
+    GlobalTensor<float> inputGm;
+    GlobalTensor<T> outputGm;
+
+    LocalTensor<float> f_local;
+    LocalTensor<T> t_local;
+
+    int64_t total_elems = 0;
+};
+
+// -----------------------------------------------------------------------------
 // Fused Kernel Implementation
 // -----------------------------------------------------------------------------
 template<typename T>
@@ -512,33 +580,41 @@ __aicore__ inline void fused_moe_small_bs_impl(
     GM_ADDR w13_weight, GM_ADDR w13_scales,
     GM_ADDR w2_weight,  GM_ADDR w2_scales,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
+    GM_ADDR y,
     GM_ADDR workspace,
     int32_t batch_size, int32_t hidden_size, int32_t inter_size,
     int32_t num_experts, int32_t top_k)
 {
     int32_t total_tokens = batch_size * top_k;
 
-    GM_ADDR y = workspace;
-    uint64_t y_size = (uint64_t)batch_size * (uint64_t)hidden_size * sizeof(T);
-
-    GM_ADDR w13_out_ptr = (GM_ADDR)((__gm__ uint8_t*)y + y_size);
-    uint64_t w13_out_size = (uint64_t)total_tokens * (uint64_t)(inter_size * 2) * sizeof(T);
+    // workspace layout:
+    // [0 : w13_out_size) : W13 output (FP32) [TotalTokens, 2 * InterDim]
+    // [w13_out_size : w13_out_size + w2_in_size) : SwiGLU output (T) [TotalTokens, InterDim]
+    // [w13_out_size + w2_in_size : end) : W2 output (FP32) [BatchSize, HiddenSize]
+    GM_ADDR w13_out_ptr = workspace;
+    uint64_t w13_out_size = (uint64_t)total_tokens * (uint64_t)(inter_size * 2) * sizeof(float);
 
     GM_ADDR w2_in_ptr = (GM_ADDR)((__gm__ uint8_t*)w13_out_ptr + w13_out_size);
+    uint64_t w2_in_size = (uint64_t)total_tokens * (uint64_t)inter_size * sizeof(T);
 
-    // Phase 0: Zero out
+    GM_ADDR w2_out_ptr = (GM_ADDR)((__gm__ uint8_t*)w2_in_ptr + w2_in_size);
+    uint64_t w2_out_size = (uint64_t)batch_size * (uint64_t)hidden_size * sizeof(float);
+
+    // Phase 0: Zero out entire workspace at once (W13 FP32 + W2_in T + W2 FP32)
     {
-        uint64_t elems = (y_size + w13_out_size) / sizeof(int32_t);
+        uint64_t total_workspace_size = w13_out_size + w2_in_size + w2_out_size;
+        uint64_t total_elems = total_workspace_size / sizeof(int32_t);
+
         KernelZeroOutLL<int32_t> zeroOp;
-        zeroOp.Init(workspace, elems);
+        zeroOp.Init(workspace, total_elems);
         zeroOp.Process();
     }
 
     AscendC::SyncAll();
 
-    // Phase 1: W13 Gemv (Broadcast X = true, Weighted = false)
+    // Phase 1: W13 Gemv (Broadcast X = true, Weighted = false, FP32 output)
     {
-        KernelGroupedGemvW4A16Moe<T> op_w13;
+        KernelGroupedGemvW4A16Moe<T, float> op_w13;
         op_w13.Init(x, w13_weight, w13_scales,
                     expert_ids, w13_out_ptr, nullptr,
                     total_tokens, hidden_size, inter_size * 2, num_experts, top_k,
@@ -548,7 +624,8 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     AscendC::SyncAll();
 
-    // Phase 2: SwiGLU
+    // Phase 2: SwiGLU (FP32 input, T output)
+    // SwiGLU reads from w13_out and writes to w2_in (separate memory areas)
     {
         KernelSwiGLU<T> op_act;
         op_act.Init(w13_out_ptr, w2_in_ptr, total_tokens, inter_size);
@@ -557,58 +634,85 @@ __aicore__ inline void fused_moe_small_bs_impl(
 
     AscendC::SyncAll();
 
-    // Phase 3: W2 Gemv (Broadcast X = false, Weighted = true)
+    // Phase 3: W2 Gemv (Broadcast X = false, Weighted = true, FP32 output)
     {
-        KernelGroupedGemvW4A16Moe<T> op_w2;
+        KernelGroupedGemvW4A16Moe<T, float> op_w2;
         op_w2.Init(w2_in_ptr, w2_weight, w2_scales,
-                   expert_ids, y, topk_weights,
+                   expert_ids, w2_out_ptr, topk_weights,
                    total_tokens, inter_size, hidden_size, num_experts, top_k,
                    false, true);
         op_w2.Process();
+    }
+
+    AscendC::SyncAll();
+
+    // Phase 4: Cast FP32 to T (final output to y)
+    {
+        KernelCastFP32ToT<T> op_cast;
+        op_cast.Init(w2_out_ptr, y, (int32_t)((uint64_t)batch_size * (uint64_t)hidden_size));
+        op_cast.Process();
     }
 }
 
 // -----------------------------------------------------------------------------
 // Extern C Entry Points
 // -----------------------------------------------------------------------------
+/*
+llvm-objdump -t ./device_aiv.o | grep "fused_moe_small_bs_w4a16_bf16_17_mix_aiv"
+000000000001d794 l       .text  0000000000000000 fused_moe_small_bs_w4a16_bf16_17_mix_aiv$local
+0000000000000000 l     O .ascend.meta.fused_moe_small_bs_w4a16_bf16_17_mix_aiv  0000000000000010 _ZL45fused_moe_small_bs_w4a16_bf16_mix_aiv_section
+0000000000000000 l       .ascend.meta.fused_moe_small_bs_w4a16_bf16_17_mix_aiv  0000000000000000 $d.2
+0000000000000000 l    d  .ascend.meta.fused_moe_small_bs_w4a16_bf16_17_mix_aiv  0000000000000000 .ascend.meta.fused_moe_small_bs_w4a16_bf16_17_mix_aiv
+000000000001d794 g     F .text  0000000000002458 fused_moe_small_bs_w4a16_bf16_17_mix_aiv
+*/
 extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_bf16(
     GM_ADDR x,
     GM_ADDR w13_weight, GM_ADDR w13_scales,
     GM_ADDR w2_weight,  GM_ADDR w2_scales,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
+    GM_ADDR y,
     GM_ADDR workspace,
     int32_t batch_size, int32_t hidden_size, int32_t inter_size,
     int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::InitSocState();
+    AscendC::ICachePreLoad(5);
 
     fused_moe_small_bs_impl<bfloat16_t>(x,
                                         w13_weight, w13_scales,
                                         w2_weight,  w2_scales,
                                         expert_ids, topk_weights,
-                                        workspace,
+                                        y, workspace,
                                         batch_size, hidden_size, inter_size,
                                         num_experts, top_k);
 }
 
+/*
+llvm-objdump -t ./device_aiv.o | grep "fused_moe_small_bs_w4a16_fp16_18_mix_aiv"
+000000000001fbec l       .text  0000000000000000 fused_moe_small_bs_w4a16_fp16_18_mix_aiv$local
+000000000001fbec g     F .text  0000000000002290 fused_moe_small_bs_w4a16_fp16_18_mix_aiv
+0000000000000048  w    O __CCE_KernelArgSize    0000000000000004 fused_moe_small_bs_w4a16_fp16_18_mix_aiv__
+*/
 extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_fp16(
     GM_ADDR x,
     GM_ADDR w13_weight, GM_ADDR w13_scales,
     GM_ADDR w2_weight,  GM_ADDR w2_scales,
     GM_ADDR expert_ids, GM_ADDR topk_weights,
+    GM_ADDR y,
     GM_ADDR workspace,
     int32_t batch_size, int32_t hidden_size, int32_t inter_size,
     int32_t num_experts, int32_t top_k)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
     AscendC::InitSocState();
+    AscendC::ICachePreLoad(5);
 
     fused_moe_small_bs_impl<half>(x,
                                  w13_weight, w13_scales,
                                  w2_weight,  w2_scales,
                                  expert_ids, topk_weights,
-                                 workspace,
+                                 y, workspace,
                                  batch_size, hidden_size, inter_size,
                                  num_experts, top_k);
 }
