@@ -132,6 +132,9 @@ at::Tensor fused_moe_w4a16_small_bs(const at::Tensor &x_in,
                                     const at::Tensor &w13_weight, const at::Tensor &w13_scales,
                                     const at::Tensor &w2_weight, const at::Tensor &w2_scales,
                                     const at::Tensor &expert_ids, const at::Tensor &topk_weights);
+
+at::Tensor batch_gemm_w4a16_small_bs(const at::Tensor &x_in, const at::Tensor &weight,
+                                     const at::Tensor &scales);
 } // namespace npu_kernel
 
 } // namespace sglang

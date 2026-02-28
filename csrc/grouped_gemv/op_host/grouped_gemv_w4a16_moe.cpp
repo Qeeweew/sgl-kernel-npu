@@ -5,6 +5,8 @@
 #include "aclrtlaunch_grouped_gemv_w4a16_moe_bf16.h"
 #include "aclrtlaunch_fused_moe_small_bs_w4a16_fp16.h"
 #include "aclrtlaunch_fused_moe_small_bs_w4a16_bf16.h"
+#include "aclrtlaunch_batch_gemm_w4a16_small_bs_fp16.h"
+#include "aclrtlaunch_batch_gemm_w4a16_small_bs_bf16.h"
 #include "torch_helper.h"
 
 namespace sglang {
@@ -183,6 +185,64 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
             y.data_ptr(),
             workspace.data_ptr(),
             batch_size, in_dim, inter_dim, num_experts, top_k
+        );
+    } else {
+        TORCH_CHECK(false, "FP16 or BF16 support only!");
+    }
+
+    return y;
+}
+
+// -----------------------------------------------------------------------------
+// Small Batch GEMM Host API (Replacement for npu_weight_quant_batchmatmul)
+// -----------------------------------------------------------------------------
+HOST_API at::Tensor batch_gemm_w4a16_small_bs(const at::Tensor &x_in, const at::Tensor &weight,
+                                              const at::Tensor &scales)
+{
+    // 1. Shape & Type Checks
+    TORCH_CHECK(weight.dtype() == at::kInt, "weight must be int32 (packed int4)");
+    TORCH_CHECK(x_in.dtype() == scales.dtype(), "x and scales must have the same dtype");
+    TORCH_CHECK(x_in.dim() == 2, "X must be 2D [BatchSize, InDim]");
+
+    int32_t batch_size = x_in.size(0);
+    int32_t in_dim = x_in.size(1);
+
+    // Weight Shape: [InDim, OutDim_Packed]
+    int32_t out_dim = weight.size(1) * 8;
+
+    TORCH_CHECK(batch_size <= 4, "batch_gemm_w4a16_small_bs only supports batch_size <= 4");
+    TORCH_CHECK(weight.size(0) == in_dim, "Weight dim 0 must match InDim");
+
+    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+    int32_t block_dim = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
+    auto acl_stream = c10_npu::getCurrentNPUStream();
+
+    // y is the final output tensor
+    at::Tensor y = at::empty({batch_size, out_dim}, x_in.options());
+
+    // workspace for FP32 accumulation (size = batch_size * out_dim * sizeof(float))
+    at::Tensor workspace = at::empty({batch_size * out_dim}, at::dtype(at::kFloat).device(x_in.device()));
+
+    // 2. Kernel Launch - split_k logic acts independently within the AIV cores
+    if (x_in.dtype() == at::kHalf) {
+        ACLRT_LAUNCH_KERNEL(batch_gemm_w4a16_small_bs_fp16)(
+            block_dim, acl_stream,
+            const_cast<void *>(x_in.data_ptr()),
+            const_cast<void *>(weight.data_ptr()),
+            const_cast<void *>(scales.data_ptr()),
+            y.data_ptr(),
+            workspace.data_ptr(),
+            batch_size, in_dim, out_dim
+        );
+    } else if (x_in.dtype() == at::kBFloat16) {
+        ACLRT_LAUNCH_KERNEL(batch_gemm_w4a16_small_bs_bf16)(
+            block_dim, acl_stream,
+            const_cast<void *>(x_in.data_ptr()),
+            const_cast<void *>(weight.data_ptr()),
+            const_cast<void *>(scales.data_ptr()),
+            y.data_ptr(),
+            workspace.data_ptr(),
+            batch_size, in_dim, out_dim
         );
     } else {
         TORCH_CHECK(false, "FP16 or BF16 support only!");

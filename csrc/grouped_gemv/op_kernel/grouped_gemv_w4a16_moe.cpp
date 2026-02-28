@@ -22,7 +22,6 @@ constexpr int32_t GROUPS_PER_BLOCK = BLOCK_SIZE / GROUP_SIZE; // 4个
 constexpr int32_t COMPUTE_ROWS     = 32;  // 每次内循环拷贝计算的行数
 constexpr int32_t PACK_RATIO       = 8;
 constexpr int32_t GROUP_TILE       = 8;
-constexpr int32_t TILE_N           = 2048;
 
 // -----------------------------------------------------------------------------
 // HardEvent IDs (only 0/1/2/3)
@@ -516,6 +515,8 @@ private:
     // Runtime flags
     bool is_broadcast_x = false;
     bool is_weighted_sum = false;
+
+    static constexpr int32_t TILE_N = 2048;
 };
 
 // -----------------------------------------------------------------------------
@@ -686,6 +687,324 @@ extern "C" __global__ __aicore__ void fused_moe_small_bs_w4a16_bf16(
                                         y, workspace,
                                         batch_size, hidden_size, inter_size,
                                         num_experts, top_k);
+}
+
+// -----------------------------------------------------------------------------
+// Kernel Batch Gemv (Batch <= 8, Split-K, Group-level Double Buffering)
+// Optimized with DataCopyPad for strided memory transfers
+// -----------------------------------------------------------------------------
+template<typename T, typename OutputT = T, int MAX_BS=4>
+class KernelBatchGemmW4A16 {
+public:
+    __aicore__ inline KernelBatchGemmW4A16() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR scales, GM_ADDR y,
+                                int32_t batch_size, int32_t in_dim, int32_t out_dim) {
+        this->batch_size = batch_size;
+        this->in_dim = in_dim;
+        this->out_dim = out_dim;
+        this->total_groups = in_dim / GROUP_SIZE;
+        this->out_dim_packed = out_dim / PACK_RATIO;
+        
+        // Dynamic Split-K Calculation
+        int32_t core_num = GetBlockNum();
+        this->num_n_tiles = (out_dim + TILE_N - 1) / TILE_N;
+        this->split_k = core_num / this->num_n_tiles;
+        if (this->split_k < 1) {
+            this->split_k = 1;
+        }
+        this->total_tasks = this->num_n_tiles * this->split_k;
+
+        xGm.SetGlobalBuffer((__gm__ T*)x);
+        weightGm.SetGlobalBuffer((__gm__ int32_t*)weight);
+        scalesGm.SetGlobalBuffer((__gm__ T*)scales);
+        yGm.SetGlobalBuffer((__gm__ OutputT*)y);
+
+        BuildLocalTensors();
+    }
+
+    __aicore__ inline void Process() {
+        int32_t core_idx = GetBlockIdx();
+        int32_t core_num = GetBlockNum();
+
+        for (int32_t task_id = core_idx; task_id < total_tasks; task_id += core_num) {
+            ProcessTask(task_id);
+        }
+    }
+
+private:
+    __aicore__ inline void BuildLocalTensors() {
+        uint32_t addr = 0;
+
+        // X buffer (2 for double buffering). Need to hold BatchSize * GROUP_SIZE
+        x_local[0] = LocalTensor<T>(TPosition::VECIN, addr, MAX_BS * GROUP_SIZE); // max_bs=8
+        addr += (uint32_t)(MAX_BS * GROUP_SIZE * sizeof(T));
+        x_local[1] = LocalTensor<T>(TPosition::VECIN, addr, MAX_BS * GROUP_SIZE);
+        addr += (uint32_t)(MAX_BS * GROUP_SIZE * sizeof(T));
+
+        // W buffer (2 for double buffering)
+        int32_t w_packed_size = GROUP_SIZE * (TILE_N / PACK_RATIO);
+        w_local[0] = LocalTensor<int32_t>(TPosition::VECIN, addr, w_packed_size);
+        addr += (uint32_t)(w_packed_size * sizeof(int32_t));
+        w_local[1] = LocalTensor<int32_t>(TPosition::VECIN, addr, w_packed_size);
+        addr += (uint32_t)(w_packed_size * sizeof(int32_t));
+
+        // S buffer (2 for double buffering)
+        s_local[0] = LocalTensor<T>(TPosition::VECIN, addr, TILE_N);
+        addr += (uint32_t)(TILE_N * sizeof(T));
+        s_local[1] = LocalTensor<T>(TPosition::VECIN, addr, TILE_N);
+        addr += (uint32_t)(TILE_N * sizeof(T));
+
+        global_acc = LocalTensor<float>(TPosition::VECCALC, addr, MAX_BS * TILE_N);
+        addr += (uint32_t)(MAX_BS * TILE_N * sizeof(float));
+
+        // Acc buffers
+        group_acc = LocalTensor<half>(TPosition::VECCALC, addr, MAX_BS * TILE_N);
+        addr += (uint32_t)(MAX_BS * TILE_N * sizeof(half) + 256);
+
+        w_half = LocalTensor<half>(TPosition::VECCALC, addr, GROUP_TILE * TILE_N);
+        addr += (uint32_t)(GROUP_TILE * TILE_N * sizeof(half));
+    }
+
+    __aicore__ inline void ProcessTask(int32_t task_id) {
+        int32_t n_tile_idx = task_id / split_k;
+        int32_t k_split_idx = task_id % split_k;
+
+        int32_t n_start = n_tile_idx * TILE_N;
+        int32_t cur_n_len = (out_dim - n_start < TILE_N) ? (out_dim - n_start) : TILE_N;
+
+        int32_t groups_per_split = (total_groups + split_k - 1) / split_k;
+        int32_t k_group_start = k_split_idx * groups_per_split;
+        int32_t k_group_end = (k_group_start + groups_per_split < total_groups) ? (k_group_start + groups_per_split) : total_groups;
+
+        if (k_group_start >= total_groups) return;
+
+        // Init Global Accumulator to 0
+        for (int b = 0; b < batch_size; ++b) {
+            Duplicate(global_acc[b * TILE_N], 0.0f, cur_n_len);
+        }
+
+        int ping = 0;
+        PrefetchGroup(ping, k_group_start, n_start, cur_n_len);
+        SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+
+        for (int32_t g = k_group_start; g < k_group_end; ++g) {
+            WaitFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+            if (g > k_group_start) {
+                WaitFlag<HardEvent::V_MTE2>(EID_V_MTE2);
+            }
+
+            if (g + 1 < k_group_end) {
+                int pong = ping ^ 1;
+                PrefetchGroup(pong, g + 1, n_start, cur_n_len);
+                SetFlag<HardEvent::MTE2_V>(EID_MTE2_V);
+            }
+
+            ComputeGroup(ping, g, cur_n_len);
+
+            if (g + 1 < k_group_end) {
+                SetFlag<HardEvent::V_MTE2>(EID_V_MTE2);
+            }
+            ping ^= 1;
+        }
+
+        WriteOut(n_start, cur_n_len);
+    }
+
+    __aicore__ inline void PrefetchGroup(int buf_id, int group_idx, int n_start, int cur_n_len) {
+        int32_t cur_n_packed = cur_n_len / PACK_RATIO;
+        int32_t n_start_packed = n_start / PACK_RATIO;
+        
+        // 1. Fetch W for the group
+        uint64_t w_offset = (uint64_t)group_idx * GROUP_SIZE * (uint64_t)out_dim_packed + n_start_packed;
+        DataCopyExtParams p_w = {
+            (uint16_t)GROUP_SIZE,
+            (uint32_t)(cur_n_packed * sizeof(int32_t)),
+            (uint32_t)((out_dim_packed - cur_n_packed) * sizeof(int32_t)),
+            0, 0
+        };
+        DataCopyPadExtParams<int32_t> pad_w{false, 0, 0, 0};
+        DataCopyPad(w_local[buf_id], weightGm[w_offset], p_w, pad_w);
+
+        // 2. Fetch Scale for the group
+        uint64_t s_offset = (uint64_t)group_idx * out_dim + n_start;
+        DataCopy(s_local[buf_id], scalesGm[s_offset], cur_n_len);
+
+        // 3. Fetch X (batch_size rows) using DataCopyPad
+        uint64_t x_offset = group_idx * GROUP_SIZE; // starting position for batch 0
+        DataCopyExtParams p_x = {
+            (uint16_t)batch_size,
+            (uint32_t)(GROUP_SIZE * sizeof(T)),
+            (uint32_t)((in_dim - GROUP_SIZE) * sizeof(T)), // distance between tail of batch b and head of batch b+1 in GM
+            0, // contiguous in UB
+            0
+        };
+        DataCopyPadExtParams<T> pad_x{false, 0, 0, 0};
+        DataCopyPad(x_local[buf_id], xGm[x_offset], p_x, pad_x);
+    }
+
+    __aicore__ inline void ComputeGroup(int buf_id, int group_idx, int cur_n_len) {
+        LocalTensor<half> x_half = x_local[buf_id].template ReinterpretCast<half>();
+        
+        // bf16 -> fp32 -> fp16 conversion (like MoE)
+        if constexpr (IsBFloat16<T>::value) {
+            LocalTensor<float> f_tmp = w_half.template ReinterpretCast<float>();
+            Cast(f_tmp, x_local[buf_id], RoundMode::CAST_NONE, batch_size * GROUP_SIZE);
+            Cast(x_half, f_tmp, RoundMode::CAST_ROUND, batch_size * GROUP_SIZE);
+        }
+
+        // Initialize group_acc per batch
+        for (int b = 0; b < batch_size; ++b) {
+            Duplicate(group_acc[b * TILE_N], (half)0.0f, cur_n_len);
+        }
+
+        // Dequantize and Mac
+        for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += GROUP_TILE) {
+            LocalTensor<int4b_t> w_int4 = w_local[buf_id][k_inner * (TILE_N / PACK_RATIO)].template ReinterpretCast<int4b_t>();
+            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * cur_n_len);
+
+            for (int b = 0; b < batch_size; ++b) {
+                // Use uint64_t GetValue to load 4 halfs at once, reducing transactions
+                LocalTensor<uint64_t> x_u64 = x_half.template ReinterpretCast<uint64_t>();
+                half x_val_arr[GROUP_TILE];
+                uint64_t* x_val_arr_u64 = (uint64_t*)x_val_arr;
+                int x_base_idx = b * GROUP_SIZE + k_inner;
+                x_val_arr_u64[0] = x_u64.GetValue(x_base_idx / 4);
+                x_val_arr_u64[1] = x_u64.GetValue(x_base_idx / 4 + 1);
+
+                for (int k = 0; k < GROUP_TILE; ++k) {
+                    Axpy(group_acc[b * TILE_N], w_half[k * TILE_N], x_val_arr[k], cur_n_len);
+                }
+            }
+        }
+
+        // Accumulate to global float
+        if constexpr (IsBFloat16<T>::value) {
+            LocalTensor<float> f_acc = w_half.template ReinterpretCast<float>();
+            LocalTensor<float> f_scale = f_acc[TILE_N];
+            Cast(f_scale, s_local[buf_id], RoundMode::CAST_NONE, cur_n_len);
+
+            for (int b = 0; b < batch_size; ++b) {
+                Cast(f_acc, group_acc[b * TILE_N], RoundMode::CAST_NONE, cur_n_len);
+                MulAddDst(global_acc[b * TILE_N], f_acc, f_scale, cur_n_len);
+            }
+        } else {
+            for (int b = 0; b < batch_size; ++b) {
+                MulAddDst(global_acc[b * TILE_N], group_acc[b * TILE_N], s_local[buf_id], cur_n_len);
+            }
+        }
+    }
+
+    __aicore__ inline void WriteOut(int n_start, int cur_n_len) {
+        SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+        WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
+
+        if (split_k > 1) {
+            SetAtomicAdd<OutputT>();
+        }
+
+        // Stride write out using DataCopyPad
+        DataCopyExtParams p_y = {
+            (uint16_t)batch_size,
+            (uint32_t)(cur_n_len * sizeof(OutputT)),
+            (uint32_t)((TILE_N - cur_n_len) * sizeof(OutputT) / 32), // Packed consecutively in UB, so src stride between tail/head is 0
+            (uint32_t)((out_dim - cur_n_len) * sizeof(OutputT)), // dst stride in GM in bytes
+            0
+        };
+
+        // Output starts at n_start for batch 0
+        uint64_t y_offset = n_start; 
+        DataCopyPad(yGm[y_offset], global_acc, p_y);
+
+        if (split_k > 1) {
+            SetAtomicNone();
+        }
+
+        SetFlag<HardEvent::MTE3_V>(EID_MTE3_V);
+        WaitFlag<HardEvent::MTE3_V>(EID_MTE3_V);
+    }
+
+private:
+    GlobalTensor<T> xGm;
+    GlobalTensor<int32_t> weightGm;
+    GlobalTensor<T> scalesGm;
+    GlobalTensor<OutputT> yGm;
+
+    LocalTensor<T> x_local[2];
+    LocalTensor<int32_t> w_local[2];
+    LocalTensor<T> s_local[2];
+
+    LocalTensor<half> group_acc;
+    LocalTensor<float> global_acc;
+    LocalTensor<half> w_half;
+
+    int32_t batch_size = 0;
+    int32_t in_dim = 0;
+    int32_t out_dim = 0;
+    int32_t out_dim_packed = 0;
+    int32_t split_k = 1;
+    int32_t total_groups = 0;
+    int32_t num_n_tiles = 0;
+    int32_t total_tasks = 0;
+    static constexpr int32_t TILE_N = 1024;
+};
+
+// -----------------------------------------------------------------------------
+// Batch GEMM W4A16 Small BS Impl (Vertical Fusion)
+// -----------------------------------------------------------------------------
+template<typename T>
+__aicore__ inline void batch_gemm_w4a16_small_bs_impl(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales,
+    GM_ADDR y, GM_ADDR workspace,
+    int32_t batch_size, int32_t in_dim, int32_t out_dim)
+{
+    // Phase 0: Zero out FP32 workspace (size = batch_size * out_dim)
+    {
+        uint64_t total_elems = (uint64_t)batch_size * (uint64_t)out_dim;
+        KernelZeroOutLL<float> zeroOp;
+        zeroOp.Init(workspace, total_elems);
+        zeroOp.Process();
+    }
+
+    AscendC::SyncAll();
+
+    // Phase 1: GEMM computation with FP32 output to workspace (atomic add)
+    {
+        KernelBatchGemmW4A16<T, float> op;
+        op.Init(x, weight, scales, workspace, batch_size, in_dim, out_dim);
+        op.Process();
+    }
+
+    AscendC::SyncAll();
+
+    // Phase 2: Cast FP32 workspace to T output
+    {
+        KernelCastFP32ToT<T> op_cast;
+        op_cast.Init(workspace, y, (int32_t)((uint64_t)batch_size * (uint64_t)out_dim));
+        op_cast.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void batch_gemm_w4a16_small_bs_fp16(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales,
+    GM_ADDR y, GM_ADDR workspace,
+    int32_t batch_size, int32_t in_dim, int32_t out_dim)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    AscendC::InitSocState();
+    batch_gemm_w4a16_small_bs_impl<half>(x, weight, scales, y, workspace,
+                                         batch_size, in_dim, out_dim);
+}
+
+extern "C" __global__ __aicore__ void batch_gemm_w4a16_small_bs_bf16(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR scales,
+    GM_ADDR y, GM_ADDR workspace,
+    int32_t batch_size, int32_t in_dim, int32_t out_dim)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
+    AscendC::InitSocState();
+    batch_gemm_w4a16_small_bs_impl<bfloat16_t>(x, weight, scales, y, workspace,
+                                               batch_size, in_dim, out_dim);
 }
 
 /*
