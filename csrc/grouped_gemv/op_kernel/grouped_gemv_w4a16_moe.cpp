@@ -35,7 +35,7 @@ static constexpr int EID_MTE3_V = 3;  // MTE3 -> V
 // -----------------------------------------------------------------------------
 // Simple Low-level ZeroOut (no pipe)
 // -----------------------------------------------------------------------------
-template<typename T, int32_t TILE = 2048>
+template<typename T>
 class KernelZeroOutLL {
 public:
     __aicore__ inline void Init(GM_ADDR dst, uint64_t elem_cnt) {
@@ -45,18 +45,18 @@ public:
 
     __aicore__ inline void Process() {
         uint32_t addr = 0;
-        LocalTensor<T> tile = LocalTensor<T>(TPosition::VECOUT, addr, TILE);
+        LocalTensor<T> tile = LocalTensor<T>(TPosition::VECOUT, addr, TILE_LEN);
 
         int32_t core_idx = GetBlockIdx();
         int32_t core_num = GetBlockNum();
 
-        Duplicate(tile, (T)0, TILE);
+        Duplicate(tile, (T)0, TILE_LEN);
         // V -> MTE3
         SetFlag<HardEvent::V_MTE3>(EID_V_MTE3);
         WaitFlag<HardEvent::V_MTE3>(EID_V_MTE3);
 
-        for (uint64_t base = (uint64_t)core_idx * TILE; base < total; base += (uint64_t)core_num * TILE) {
-            uint32_t len = (uint32_t)((total - base < (uint64_t)TILE) ? (total - base) : TILE);
+        for (uint64_t base = (uint64_t)core_idx * TILE_LEN; base < total; base += (uint64_t)core_num * TILE_LEN) {
+            uint32_t len = (uint32_t)((total - base < (uint64_t)TILE_LEN) ? (total - base) : TILE_LEN);
             DataCopy(dstGm[base], tile, len);
         }
         DataSyncBarrier<MemDsbT::DDR>();
@@ -65,6 +65,7 @@ public:
 private:
     GlobalTensor<T> dstGm;
     uint64_t total = 0;
+    static constexpr int32_t TILE_LEN = 2048;
 };
 
 // -----------------------------------------------------------------------------
@@ -72,7 +73,7 @@ private:
 // Layout: [Gate | Value] split at inter_dim
 // Input: FP32, Output: T
 // -----------------------------------------------------------------------------
-template<typename T, uint32_t TILE_LEN = 1024>
+template<typename T>
 class KernelSwiGLU {
 public:
     __aicore__ inline KernelSwiGLU() {}
@@ -162,6 +163,7 @@ private:
 
     int32_t total_rows = 0;
     int32_t inter_dim  = 0;
+    static constexpr int TILE_LEN = 1024;
 };
 
 template<typename T, typename OutputT = T>
@@ -522,7 +524,7 @@ private:
 // -----------------------------------------------------------------------------
 // Kernel Cast FP32 to T (for final output conversion)
 // -----------------------------------------------------------------------------
-template<typename T, uint32_t TILE_LEN = 2048>
+template<typename T>
 class KernelCastFP32ToT {
 public:
     __aicore__ inline KernelCastFP32ToT() {}
@@ -570,6 +572,7 @@ private:
     LocalTensor<T> t_local;
 
     int64_t total_elems = 0;
+    static constexpr uint32_t TILE_LEN = 2048;
 };
 
 // -----------------------------------------------------------------------------
@@ -821,7 +824,8 @@ private:
             (uint16_t)GROUP_SIZE,
             (uint32_t)(cur_n_packed * sizeof(int32_t)),
             (uint32_t)((out_dim_packed - cur_n_packed) * sizeof(int32_t)),
-            0, 0
+            (uint32_t)((TILE_N / PACK_RATIO - cur_n_packed) * sizeof(int32_t) / 32),
+            0
         };
         DataCopyPadExtParams<int32_t> pad_w{false, 0, 0, 0};
         DataCopyPad(w_local[buf_id], weightGm[w_offset], p_w, pad_w);
@@ -846,7 +850,7 @@ private:
     __aicore__ inline void ComputeGroup(int buf_id, int group_idx, int cur_n_len) {
         LocalTensor<half> x_half = x_local[buf_id].template ReinterpretCast<half>();
         
-        // bf16 -> fp32 -> fp16 conversion (like MoE)
+        // bf16 -> fp32 -> fp16 conversion
         if constexpr (IsBFloat16<T>::value) {
             LocalTensor<float> f_tmp = w_half.template ReinterpretCast<float>();
             Cast(f_tmp, x_local[buf_id], RoundMode::CAST_NONE, batch_size * GROUP_SIZE);
@@ -861,7 +865,7 @@ private:
         // Dequantize and Mac
         for (int32_t k_inner = 0; k_inner < GROUP_SIZE; k_inner += GROUP_TILE) {
             LocalTensor<int4b_t> w_int4 = w_local[buf_id][k_inner * (TILE_N / PACK_RATIO)].template ReinterpretCast<int4b_t>();
-            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * cur_n_len);
+            Cast(w_half, w_int4, RoundMode::CAST_NONE, GROUP_TILE * TILE_N);
 
             for (int b = 0; b < batch_size; ++b) {
                 // Use uint64_t GetValue to load 4 halfs at once, reducing transactions
@@ -946,7 +950,7 @@ private:
     int32_t total_groups = 0;
     int32_t num_n_tiles = 0;
     int32_t total_tasks = 0;
-    static constexpr int32_t TILE_N = 1024;
+    static constexpr int32_t TILE_N = 2048;
 };
 
 // -----------------------------------------------------------------------------

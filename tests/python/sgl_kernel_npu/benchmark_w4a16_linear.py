@@ -24,8 +24,8 @@ device = torch.device("npu:0")
 dtype = torch.bfloat16  # Native bmm uses bfloat16
 
 # Model dimensions (typical for MoE models)
-HIDDEN_SIZE = 4096
-INTERMEDIATE_SIZE = 4096
+HIDDEN_SIZE = 8192
+INTERMEDIATE_SIZE = 8192
 GROUP_SIZE = 32
 
 # Number of weight copies to avoid cache effects in graph mode

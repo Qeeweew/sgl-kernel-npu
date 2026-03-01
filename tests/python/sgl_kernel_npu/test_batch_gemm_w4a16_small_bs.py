@@ -24,8 +24,8 @@ dtype = torch.bfloat16
 
 # Test dimensions
 BATCH_SIZES = [1]
-HIDDEN_SIZE = 4096
-INTERMEDIATE_SIZE = 4096
+HIDDEN_SIZE = 768
+INTERMEDIATE_SIZE = 1536
 GROUP_SIZE = 32
 
 # Tolerance for bf16

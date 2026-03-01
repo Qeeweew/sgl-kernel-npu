@@ -1,7 +1,6 @@
 import math
 import torch
 import torch_npu
-import torch.utils.benchmark as benchmark
 import sys
 
 try:
@@ -20,8 +19,35 @@ INTER_SIZE = 768
 GROUP_SIZE = 32
 ROUTING_BLOCKS = NUM_EXPERTS // TOP_K  # 16
 
+# Timing configuration
+WARMUP_ITERATIONS = 10
+BENCHMARK_ITERATIONS = 100
+
 device = torch.device("npu:0")
 dtype = torch.float16
+
+
+# ------------------------------------------------------------
+# NPU timing with events (same as benchmark_w4a16_linear.py)
+# ------------------------------------------------------------
+def measure_time_with_events(fn, num_iters: int = 100) -> float:
+    """Measure NPU execution time using events."""
+    # Warmup
+    for _ in range(WARMUP_ITERATIONS):
+        fn()
+    torch.npu.synchronize()
+
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(num_iters):
+        fn()
+    end_event.record()
+    torch.npu.synchronize()
+
+    elapsed_ms = start_event.elapsed_time(end_event) / num_iters
+    return elapsed_ms
 
 
 # ------------------------------------------------------------
@@ -209,21 +235,13 @@ def benchmark_bs(B, w13, w13_scale, w13_offset, w2, w2_scale, w2_offset):
 
     def run_ref():
         g_ref.replay()
-        torch.npu.synchronize()
 
     def run_custom():
         g_custom.replay()
-        torch.npu.synchronize()
 
-    t_ref = benchmark.Timer(
-        stmt="run_ref()",
-        globals={"run_ref": run_ref}
-    ).blocked_autorange(min_run_time=2.0)
-
-    t_custom = benchmark.Timer(
-        stmt="run_custom()",
-        globals={"run_custom": run_custom}
-    ).blocked_autorange(min_run_time=2.0)
+    # Event-based timing
+    t_ref_ms = measure_time_with_events(run_ref, BENCHMARK_ITERATIONS)
+    t_custom_ms = measure_time_with_events(run_custom, BENCHMARK_ITERATIONS)
 
     bytes_total = (
         B * TOP_K * ROUTING_BLOCKS *
@@ -232,10 +250,10 @@ def benchmark_bs(B, w13, w13_scale, w13_offset, w2, w2_scale, w2_offset):
 
     return {
         "B": B,
-        "ref_us": t_ref.mean * 1e6 / ROUTING_BLOCKS,
-        "custom_us": t_custom.mean * 1e6 / ROUTING_BLOCKS,
-        "ref_GBs": bytes_total / t_ref.mean / 1e9,
-        "custom_GBs": bytes_total / t_custom.mean / 1e9,
+        "ref_us": t_ref_ms * 1e3 / ROUTING_BLOCKS,
+        "custom_us": t_custom_ms * 1e3 / ROUTING_BLOCKS,
+        "ref_GBs": bytes_total / (t_ref_ms * 1e-3) / 1e9,
+        "custom_GBs": bytes_total / (t_custom_ms * 1e-3) / 1e9,
     }
 
 
