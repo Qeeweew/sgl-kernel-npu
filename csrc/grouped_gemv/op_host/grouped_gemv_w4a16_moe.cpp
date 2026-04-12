@@ -148,7 +148,7 @@ HOST_API at::Tensor fused_moe_w4a16_small_bs(
     int64_t total_workspace_elems = w13_out_elems + swiglu_out_elems + w2_out_elems;
 
     // y is the final output tensor
-    at::Tensor y = at::zeros({batch_size, out_dim}, x_in.options());
+    at::Tensor y = at::empty({batch_size, out_dim}, x_in.options());
 
     // workspace for intermediate results (mix of FP32 and T)
     at::Tensor workspace = at::empty({total_workspace_elems}, x_in.options());
